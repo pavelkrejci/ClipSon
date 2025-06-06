@@ -11,10 +11,13 @@ Nextcloud clipboard synchronization tool for Linux (Python) and Windows (PowerSh
 - **Real-time synchronization** - Automatically monitors clipboard changes
 - **Text and image support** - Handles both text content and images
 - **Duplicate prevention** - Avoids saving identical clipboard content
+- **Multi-device synchronization** - All instances must use the same Nextcloud account to see each other's updates
 
 ## Usage
 
 0. copy the `config_template.json` file to `config.json` and edit it to set your Nextcloud WebDAV URL, username, and password, proxy, etc
+
+**Important:** All ClipSon instances across different devices (Windows, Linux, etc.) must be configured with the same Nextcloud account credentials to synchronize clipboard content between them. Each device will create its own clipboard file (e.g., `clipboard-hostname.txt`) in the shared Nextcloud folder, allowing all instances to monitor and sync changes from other devices.
 
 ### Windows (PowerShell)
 
@@ -40,6 +43,7 @@ Nextcloud clipboard synchronization tool for Linux (Python) and Windows (PowerSh
 4. Content will be automatically saved and synced to Nextcloud
 
 ## Configuration
+
 ### Proxy Configuration
 - See the section "proxy" in `config.json`
 
@@ -47,6 +51,7 @@ Nextcloud clipboard synchronization tool for Linux (Python) and Windows (PowerSh
 - Ensure your Nextcloud instance is accessible via WebDAV.
 ### Nextcloud credentials and WebDAV URL configuration 
 - Edit the `config.json` file to set your Nextcloud WebDAV URL, username, and password.
+**Note:** For multi-device synchronization, ensure all ClipSon instances use the same Nextcloud account and remote folder configuration.
 
 ### Application Configuration
 - The `config.json` file contains application level tweaks:
