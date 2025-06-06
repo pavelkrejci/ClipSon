@@ -41,7 +41,7 @@ CONFIG_DATA = load_configuration()
 
 # Global debug constant (now from config)
 DEBUG = CONFIG_DATA['app']['debug_enabled']
-DEBUG2 = False
+
 
 # Configuration (now loaded from config.json)
 CONFIG = {
@@ -117,7 +117,7 @@ class ClipSon:
             print(f"NOTIFICATION: {title} - {message}")
     
     def get_clipboard_content(self):
-        """Get current clipboard content"""
+        """Get current clipboard content (text only)"""
         try:
             result = subprocess.run(['xclip', '-selection', 'clipboard', '-o'], 
                                   capture_output=True, text=True)
@@ -126,16 +126,68 @@ class ClipSon:
         except Exception:
             pass
         return None
-    
-    def set_clipboard_content(self, content):
-        """Set clipboard content"""
+
+    def has_clipboard_image(self):
+        """Check if clipboard contains an image"""
         try:
-            subprocess.run(['xclip', '-selection', 'clipboard'], 
-                          input=content, text=True, check=True)
-            return True
+            # Check if clipboard has image data
+            result = subprocess.run(['xclip', '-selection', 'clipboard', '-t', 'TARGETS', '-o'], 
+                                  capture_output=True, text=True)
+            if result.returncode == 0:
+                targets = result.stdout.strip().split('\n')
+                # Look for image MIME types
+                image_targets = ['image/png', 'image/jpeg', 'image/gif', 'image/bmp', 'image/tiff']
+                return any(target.strip() in image_targets for target in targets)
         except Exception:
-            return False
-    
+            pass
+        return False
+
+    def save_clipboard_image(self):
+        """Save clipboard image to file and upload"""
+        try:
+            # Get image data from clipboard
+            result = subprocess.run(['xclip', '-selection', 'clipboard', '-t', 'image/png', '-o'], 
+                                  capture_output=True)
+            
+            if result.returncode == 0 and result.stdout:
+                # Calculate hash from image data
+                import hashlib
+                current_image_hash = hashlib.md5(result.stdout).hexdigest()
+                
+                # Check if this is the same image as last time
+                if hasattr(self, 'last_image_hash') and current_image_hash == self.last_image_hash:
+                    if DEBUG:
+                        print(f"DEBUG: Image hash matches previous - skipping save and upload")
+                    return False
+                
+                # Hash is different, proceed with saving
+                file_number = self.get_next_file_number()
+                filename = self.output_dir / f"clipboard_image_{file_number:03d}.png"
+                
+                with open(filename, 'wb') as f:
+                    f.write(result.stdout)
+                
+                print(f"{datetime.now().strftime('%H:%M:%S')} - Image saved: {filename}")
+                
+                # Update hash tracking
+                self.last_image_hash = current_image_hash
+                
+                # Upload image to WebDAV (use hostname-based file name)
+                remote_image_file = f"clipboard-{self.hostname}.png"
+                if self.upload_to_webdav(filename, remote_image_file):
+                    print(f"{datetime.now().strftime('%H:%M:%S')} - Uploaded image to WebDAV: {remote_image_file}")
+                
+                # Show notification
+                self.show_notification("ClipSon", f"Image captured: {filename}")
+                
+                # Update last clipboard content to prevent re-capture
+                self.last_clipboard_content = f"__IMAGE_CONTENT_{len(result.stdout)}_BYTES__"
+                
+                return True
+        except Exception as e:
+            print(f"Error saving clipboard image: {e}")
+        return False
+
     def test_webdav_connection(self):
         """Test WebDAV connection"""
         try:
@@ -170,10 +222,7 @@ class ClipSon:
                 print(f"Failed to discover remote clipboard files: {response.status_code} {response.reason}")
                 if DEBUG:
                     print(f"DEBUG: Response text: {response.text}")
-                return []
-            
-            if DEBUG2:
-                print(f"DEBUG2: Received response from WebDAV: {response.text}")
+                return []                    
             
             # Parse XML response
             root = ET.fromstring(response.text)
@@ -185,7 +234,7 @@ class ClipSon:
                 
                 if displayname_elem is not None and displayname_elem.text:
                     filename = displayname_elem.text
-                    if filename.startswith('clipboard-') and filename.endswith('.txt'):
+                    if filename.startswith('clipboard-') and (filename.endswith('.txt') or filename.endswith('.png')):
                         last_modified = None
                         if lastmodified_elem is not None and lastmodified_elem.text:
                             try:
@@ -215,13 +264,13 @@ class ClipSon:
         print("Discovering remote clipboard files...")
         remote_files = self.get_remote_clipboard_files()
         
-        # Filter out our own file
-        my_file = f"clipboard-{self.hostname}.txt"
-        peer_files = [f for f in remote_files if f['name'] != my_file]
+        # Filter out our own files (both text and image)
+        base = f"clipboard-{self.hostname}"
+        peer_files = [f for f in remote_files if f['name'] not in (f"{base}.txt", f"{base}.png")]
         
         if not peer_files:
             print("No remote clipboard files from other machines found.")
-            print(f"Will only upload to: {my_file}")
+            print(f"Will only upload to: {base}.txt and {base}.png")
             return []
         
         print(f"\nFound {len(peer_files)} remote peer(s):")
@@ -278,8 +327,12 @@ class ClipSon:
             response = requests.get(webdav_url, auth=self.auth, timeout=10)
             
             if response.status_code == 200:
-                with open(local_file, 'w', encoding='utf-8') as f:
-                    f.write(response.text)
+                if local_file.endswith('.png'):
+                    with open(local_file, 'wb') as f:
+                        f.write(response.content)
+                else:
+                    with open(local_file, 'w', encoding='utf-8') as f:
+                        f.write(response.text)
                 return True
         except Exception:
             pass
@@ -313,8 +366,8 @@ class ClipSon:
         
         # Get current list of remote files
         remote_files = self.get_remote_clipboard_files()
-        my_file = f"clipboard-{self.hostname}.txt"
-        peer_files = [f for f in remote_files if f['name'] != my_file]
+        base = f"clipboard-{self.hostname}"
+        peer_files = [f for f in remote_files if f['name'] not in (f"{base}.txt", f"{base}.png")]
         
         most_recent_content = None
         most_recent_timestamp = 0
@@ -323,14 +376,16 @@ class ClipSon:
         for file_info in peer_files:
             filename = file_info['name']
             
-            # Add new files to tracking
-            if filename not in self.remote_file_timestamps:
+            # Check if this is a new file or an updated file
+            is_new_file = filename not in self.remote_file_timestamps
+            
+            if is_new_file:
                 if file_info['last_modified']:
-                    self.remote_file_timestamps[filename] = file_info['last_modified'].timestamp()
+                    self.remote_file_timestamps[filename] = 0  # Set to 0 so it will be processed as an update
                     print(f"{datetime.now().strftime('%H:%M:%S')} - New remote peer discovered: {filename}")
                 else:
                     self.remote_file_timestamps[filename] = 0
-                continue
+                    continue
             
             if not file_info['last_modified']:
                 continue
@@ -338,19 +393,29 @@ class ClipSon:
             remote_timestamp = file_info['last_modified'].timestamp()
             last_known_timestamp = self.remote_file_timestamps[filename]
             
-            # Check if this file has been updated
+            # Check if this file has been updated (or is newly discovered)
             if remote_timestamp > last_known_timestamp:
-                print(f"{datetime.now().strftime('%H:%M:%S')} - Remote file updated: {filename}")
+                if not is_new_file:
+                    print(f"{datetime.now().strftime('%H:%M:%S')} - Remote file updated: {filename}")
                 
                 # Download and check if it's the most recent
-                temp_download_file = f'./temp-remote-download-{filename.replace(".txt", "")}.txt'
+                file_ext = Path(filename).suffix
+                temp_download_file = f'./temp-remote-download-{filename.replace(file_ext, "")}{file_ext}'
                 
                 if self.download_remote_file(filename, temp_download_file):
                     try:
-                        with open(temp_download_file, 'r', encoding='utf-8') as f:
-                            file_content = f.read()
+                        if file_ext == '.txt':
+                            with open(temp_download_file, 'r', encoding='utf-8') as f:
+                                file_content = f.read()
+                            has_content = file_content.strip()
+                        elif file_ext == '.png':
+                            with open(temp_download_file, 'rb') as f:
+                                file_content = f.read()
+                            has_content = len(file_content) > 0
+                        else:
+                            has_content = False
                         
-                        if file_content.strip() and remote_timestamp > most_recent_timestamp:
+                        if has_content and remote_timestamp > most_recent_timestamp:
                             most_recent_content = file_content
                             most_recent_timestamp = remote_timestamp
                             most_recent_filename = filename
@@ -368,11 +433,23 @@ class ClipSon:
         
         # Apply the most recent update if found
         if most_recent_content:
-            if self.set_clipboard_content(most_recent_content):
-                # Show notification
-                preview = most_recent_content[:50] + "..." if len(most_recent_content) > 50 else most_recent_content
-                self.show_notification("ClipSon", f"Remote update from {most_recent_filename}: {preview}")
-                return most_recent_content
+            if most_recent_filename.endswith('.png'):
+                # Set clipboard image and show notification
+                if self.set_clipboard_image(most_recent_content):
+                    self.show_notification("ClipSon", f"Remote image update from {most_recent_filename}")
+                    # Use the binary content as our "last clipboard content" to prevent re-upload
+                    self.last_clipboard_content = f"__IMAGE_CONTENT_{len(most_recent_content)}_BYTES__"
+                else:
+                    self.show_notification("ClipSon", f"Remote image update from {most_recent_filename} (clipboard set failed, saved locally)")
+                    self.last_clipboard_content = f"__IMAGE_CONTENT_{len(most_recent_content)}_BYTES__"
+            else:
+                if self.set_clipboard_content(most_recent_content):
+                    # Show notification
+                    preview = most_recent_content[:50] + "..." if len(most_recent_content) > 50 else most_recent_content
+                    self.show_notification("ClipSon", f"Remote update from {most_recent_filename}: {preview}")
+                    self.last_clipboard_content = most_recent_content  # Prevent re-capture of this content
+            
+            return most_recent_content
         
         return None
     
@@ -404,6 +481,32 @@ class ClipSon:
         preview = content[:50] + "..." if len(content) > 50 else content
         self.show_notification("ClipSon", f"Captured: {preview}")
     
+    def set_clipboard_content(self, content):
+        """Set clipboard content"""
+        try:
+            subprocess.run(['xclip', '-selection', 'clipboard'], 
+                          input=content, text=True, check=True)
+            return True
+        except Exception:
+            return False
+
+    def set_clipboard_image(self, image_data):
+        """Set clipboard image content"""
+        try:
+            # Update hash tracking immediately to prevent re-capture
+            import hashlib
+            self.last_image_hash = hashlib.md5(image_data).hexdigest()
+            if DEBUG:
+                print(f"DEBUG: Updated last_image_hash to prevent re-capture: {self.last_image_hash}")
+            
+            # Use xclip to set image data to clipboard
+            subprocess.run(['xclip', '-selection', 'clipboard', '-t', 'image/png'], 
+                          input=image_data, check=True)
+            return True
+        except Exception as e:
+            print(f"Error setting clipboard image: {e}")
+            return False
+
     def run(self):
         """Main run loop"""
         # Check dependencies
@@ -432,14 +535,19 @@ class ClipSon:
             try:
                 # Check all remote files for updates
                 remote_content = self.check_all_remote_files_for_updates()
-                if remote_content:
-                    self.last_clipboard_content = remote_content
+                # Note: last_clipboard_content is already updated inside check_all_remote_files_for_updates()
                 
-                # Check clipboard content
-                current_content = self.get_clipboard_content()
-                if current_content and current_content != self.last_clipboard_content:
-                    self.save_clipboard_text(current_content)
-                    self.last_clipboard_content = current_content
+                # Check for clipboard image first (higher priority)
+                if self.has_clipboard_image():
+                    # Check if this is a new image (different from our last captured content)
+                    if not self.last_clipboard_content.startswith("__IMAGE_CONTENT_"):
+                        self.save_clipboard_image()
+                else:
+                    # Check clipboard text content
+                    current_content = self.get_clipboard_content()
+                    if current_content and current_content != self.last_clipboard_content:
+                        self.save_clipboard_text(current_content)
+                        self.last_clipboard_content = current_content
                 
                 # Wait before next check
                 time.sleep(0.5)

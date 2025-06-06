@@ -42,15 +42,20 @@ function Write-DebugMsg {
 
 # Configuration (now loaded from config.json)
 $NextcloudConfig = @{
-    ServerUrl = $Config.nextcloud.server_url  # Replace with your Nextcloud server URL
-    Username = $Config.nextcloud.username                        # Replace with your username
-    Password = $Config.nextcloud.password                    # Empty password will prompt for input
-    RemoteFolder = $Config.nextcloud.remote_folder                   # Folder in Nextcloud where files will be uploaded
+    ServerUrl    = $Config.nextcloud.server_url      # Replace with your Nextcloud server URL
+    Username     = $Config.nextcloud.username        # Replace with your username
+    Password     = $Config.nextcloud.password        # Empty password will prompt for input
+    RemoteFolder = $Config.nextcloud.remote_folder   # Folder in Nextcloud where files will be uploaded
     # Proxy Configuration (optional)
-    ProxyUrl = $Config.proxy.url                                    # e.g., "http://proxy.company.com:8080" or "" for no proxy
-    ProxyUsername = $Config.proxy.username                               # Proxy username (if required)
-    ProxyPassword = $Config.proxy.password                               # Proxy password (if required)
-    UseSystemProxy = $Config.proxy.use_system_proxy                           # Use system proxy settings if true, manual proxy if false
+    ProxyUrl     = $Config.proxy.url                 # e.g., "http://proxy.company.com:8080" or "" for no proxy
+    ProxyUsername= $Config.proxy.username            # Proxy username (if required)
+    ProxyPassword= $Config.proxy.password            # Proxy password (if required)
+    UseSystemProxy= $Config.proxy.use_system_proxy   # Use system proxy settings if true, manual proxy if false
+}
+
+# Normalize RemoteFolder to ensure trailing slash
+if (-not $NextcloudConfig.RemoteFolder.EndsWith('/')) {
+    $NextcloudConfig.RemoteFolder += '/'
 }
 
 # Function to get password if needed
@@ -205,7 +210,7 @@ function Send-FileToNextcloud {
         $Response.Close()
         
         if ($StatusCode -eq "Created" -or $StatusCode -eq "NoContent") {
-            Write-Host "Successfully uploaded: $LocalFilePath -> $RemoteFilePath"
+            Write-DebugMsg "Successfully uploaded: $LocalFilePath -> $RemoteFilePath"
             return $true
         } else {
             Write-Warning "Upload failed with status: $StatusCode"
@@ -523,7 +528,7 @@ function Get-RemoteClipboardFiles {
             $displayNameNode = $node.SelectSingleNode(".//D:displayname", $NamespaceManager)
             $lastModifiedNode = $node.SelectSingleNode(".//D:getlastmodified", $NamespaceManager)
             
-            if ($displayNameNode -and $displayNameNode.InnerText -match "^clipboard-.*\.txt$") {
+            if ($displayNameNode -and $displayNameNode.InnerText -match "^clipboard-.*\.(txt|png)$") {
                 $lastModified = $null
                 if ($lastModifiedNode -and $lastModifiedNode.InnerText) {
                     try {
@@ -557,14 +562,14 @@ function Select-RemoteSyncFile {
     Write-Host "Discovering remote clipboard files..." -ForegroundColor Green
     $remoteFiles = Get-RemoteClipboardFiles -Connection $Connection
     
-    # Filter out files with current hostname
+    # Filter out files with current hostname (both text and image)
     $hostname = $env:COMPUTERNAME
-    $myFile = "clipboard-$hostname.txt"
-    $filteredFiles = $remoteFiles | Where-Object { $_.Name -ne $myFile }
+    $myFiles = @("clipboard-$hostname.txt", "clipboard-$hostname.png")
+    $filteredFiles = $remoteFiles | Where-Object { $_.Name -notin $myFiles }
     
     if ($filteredFiles.Count -eq 0) {
         Write-Host "No remote clipboard files from other machines found." -ForegroundColor Yellow
-        Write-Host "Will only upload to: $myFile" -ForegroundColor Green
+        Write-Host "Will only upload to: clipboard-$hostname.txt and clipboard-$hostname.png" -ForegroundColor Green
         return @()  # Return empty array instead of null
     }
     
@@ -607,22 +612,24 @@ function Check-AllRemoteFilesForUpdates {
         # Get current list of remote files
         $remoteFiles = Get-RemoteClipboardFiles -Connection $Connection
         $hostname = $env:COMPUTERNAME
-        $myFile = "clipboard-$hostname.txt"
-        $peerFiles = $remoteFiles | Where-Object { $_.Name -ne $myFile }
+        $myFiles = @("clipboard-$hostname.txt", "clipboard-$hostname.png")
+        $peerFiles = $remoteFiles | Where-Object { $_.Name -notin $myFiles }
         
         $mostRecentContent = $null
         $mostRecentTimestamp = [DateTime]::MinValue
         $mostRecentFilename = $null
+        $tempImageFile = $null
         
         foreach ($fileInfo in $peerFiles) {
             $filename = $fileInfo.Name
             
-            # Add new files to tracking
-            if (-not $global:remotePeerTimestamps.ContainsKey($filename)) {
+            # Check if this is a new file or an updated file
+            $isNewFile = -not $global:remotePeerTimestamps.ContainsKey($filename)
+            
+            if ($isNewFile) {
                 $timestamp = if ($fileInfo.LastModified) { $fileInfo.LastModified } else { [DateTime]::MinValue }
-                $global:remotePeerTimestamps[$filename] = $timestamp
+                $global:remotePeerTimestamps[$filename] = [DateTime]::MinValue  # Set to MinValue so it will be processed as an update
                 Write-Host "$(Get-Date -Format 'HH:mm:ss') - New remote peer discovered: $filename" -ForegroundColor Yellow
-                continue
             }
             
             if (-not $fileInfo.LastModified) {
@@ -632,30 +639,46 @@ function Check-AllRemoteFilesForUpdates {
             $remoteTimestamp = $fileInfo.LastModified
             $lastKnownTimestamp = $global:remotePeerTimestamps[$filename]
             
-            # Check if this file has been updated
+            # Check if this file has been updated (or is newly discovered)
             if ($remoteTimestamp -gt $lastKnownTimestamp) {
-                Write-Host "$(Get-Date -Format 'HH:mm:ss') - Remote file updated: $filename" -ForegroundColor Cyan
+                if (-not $isNewFile) {
+                    Write-Host "$(Get-Date -Format 'HH:mm:ss') - Remote file updated: $filename" -ForegroundColor Cyan
+                }
                 
                 # Download and check if it's the most recent
-                $tempDownloadFile = ".\temp-remote-download-$($filename.Replace('.txt', '')).txt"
+                $fileExtension = [System.IO.Path]::GetExtension($filename)
+                $tempDownloadFile = ".\temp-remote-download-$($filename.Replace($fileExtension, ''))$fileExtension"
                 $remotePath = $NextcloudConfig.RemoteFolder + $filename
                 
                 $downloadResult = Get-NextcloudFile -Connection $Connection -RemoteFilePath $remotePath -LocalFilePath $tempDownloadFile -IncludeTimestamp
                 
                 if ($downloadResult -and $downloadResult.Success) {
                     try {
-                        $fileContent = Get-Content $tempDownloadFile -Raw -Encoding UTF8
+                        $hasContent = $false
+                        if ($fileExtension -eq '.txt') {
+                            $fileContent = Get-Content $tempDownloadFile -Raw -Encoding UTF8
+                            $hasContent = ($fileContent -and $fileContent.Trim() -ne "")
+                        } elseif ($fileExtension -eq '.png') {
+                            $fileContent = [System.IO.File]::ReadAllBytes($tempDownloadFile)
+                            $hasContent = ($fileContent -and $fileContent.Length -gt 0)
+                        }
                         
-                        if ($fileContent -and $fileContent.Trim() -ne "" -and $remoteTimestamp -gt $mostRecentTimestamp) {
+                        if ($hasContent -and $remoteTimestamp -gt $mostRecentTimestamp) {
                             $mostRecentContent = $fileContent
                             $mostRecentTimestamp = $remoteTimestamp
                             $mostRecentFilename = $filename
+                            if ($fileExtension -eq '.png') {
+                                $tempImageFile = $tempDownloadFile
+                            }
                         }
                         
                         # Update timestamp regardless
                         $global:remotePeerTimestamps[$filename] = $remoteTimestamp
                         
-                        Remove-Item $tempDownloadFile -ErrorAction SilentlyContinue
+                        # Only remove temp file if it's not the most recent image (we need it for hash)
+                        if ($fileExtension -ne '.png' -or $filename -ne $mostRecentFilename) {
+                            Remove-Item $tempDownloadFile -ErrorAction SilentlyContinue
+                        }
                     }
                     catch {
                         Write-Warning "Error processing $filename`: $($_.Exception.Message)"
@@ -667,11 +690,35 @@ function Check-AllRemoteFilesForUpdates {
         
         # Apply the most recent update if found
         if ($mostRecentContent) {
-            [System.Windows.Forms.Clipboard]::SetText($mostRecentContent)
-            
-            # Show notification
-            $preview = if ($mostRecentContent.Length -gt 50) { $mostRecentContent.Substring(0, 50) + "..." } else { $mostRecentContent }
-            Show-ClipboardNotification -Title "ClipSon" -Message "Remote update from $mostRecentFilename`: $preview" -Icon "Info"
+            if ($mostRecentFilename.EndsWith('.png')) {
+                # Set clipboard image
+                Add-Type -AssemblyName System.Drawing
+                $memoryStream = New-Object System.IO.MemoryStream(,$mostRecentContent)
+                $image = [System.Drawing.Image]::FromStream($memoryStream)
+                [System.Windows.Forms.Clipboard]::SetImage($image)
+                
+                # Update last clipboard state to prevent re-capture IMMEDIATELY
+                if ($tempImageFile -and (Test-Path $tempImageFile)) {
+                    $script:lastClipboardImageHash = (Get-FileHash -Algorithm MD5 -LiteralPath $tempImageFile).Hash
+                    Write-DebugMsg "Updated lastClipboardImageHash to prevent re-capture: $($script:lastClipboardImageHash)"
+                    Remove-Item $tempImageFile -ErrorAction SilentlyContinue
+                }
+                
+                $image.Dispose()
+                $memoryStream.Dispose()
+                
+                # Show notification
+                Show-ClipboardNotification -Title "ClipSon" -Message "Remote image update from $mostRecentFilename" -Icon "Info"
+            } else {
+                [System.Windows.Forms.Clipboard]::SetText($mostRecentContent)
+                
+                # Show notification
+                $preview = if ($mostRecentContent.Length -gt 50) { $mostRecentContent.Substring(0, 50) + "..." } else { $mostRecentContent }
+                Show-ClipboardNotification -Title "ClipSon" -Message "Remote update from $mostRecentFilename`: $preview" -Icon "Info"
+                
+                # Update last clipboard state to prevent re-capture
+                $script:lastClipboardContent = $mostRecentContent
+            }
             
             return $mostRecentContent
         }
@@ -822,13 +869,18 @@ Write-Host "Remote check interval: $($remoteCheckInterval.TotalSeconds) seconds"
 Write-Host "Multiple peer synchronization: Enabled" -ForegroundColor Green
 
 $lastClipboardContent = ""
+$lastClipboardImageHash = ""
+
+# Change these to script-level variables for proper access from functions
+$script:lastClipboardContent = ""
+$script:lastClipboardImageHash = ""
 
 while ($true) {
     try {
         # Check all remote files for updates
         $remoteContent = Check-AllRemoteFilesForUpdates -Connection $webdavConnection
         if ($remoteContent) {
-            $lastClipboardContent = $remoteContent
+            # Update handled inside the function now
         }
         
         # Check if clipboard has text content
@@ -836,7 +888,7 @@ while ($true) {
             $currentContent = [System.Windows.Forms.Clipboard]::GetText()
             
             # Only save if content has changed
-            if ($currentContent -ne $lastClipboardContent -and $currentContent.Trim() -ne "") {
+            if ($currentContent -ne $script:lastClipboardContent -and $currentContent.Trim() -ne "") {
                 Write-DebugMsg "About to get next file number"
                 Write-DebugMsg "Pre-call fileCounter: '$global:fileCounter'"
                 
@@ -882,13 +934,34 @@ while ($true) {
                 $preview = if ($currentContent.Length -gt 50) { $currentContent.Substring(0, 50) + "..." } else { $currentContent }
                 Show-ClipboardNotification -Title "ClipSon" -Message "Captured: $preview" -Icon "Info"
                 
-                $lastClipboardContent = $currentContent
+                $script:lastClipboardContent = $currentContent
             }
         }
         # Check if clipboard has image content
         elseif ([System.Windows.Forms.Clipboard]::ContainsImage()) {
             $image = [System.Windows.Forms.Clipboard]::GetImage()
             if ($image -ne $null) {
+                # Save image to memory stream to calculate hash without creating file
+                $memoryStream = New-Object System.IO.MemoryStream
+                $image.Save($memoryStream, [System.Drawing.Imaging.ImageFormat]::Png)
+                $imageBytes = $memoryStream.ToArray()
+                $memoryStream.Dispose()
+                
+                # Calculate hash from memory
+                $md5 = [System.Security.Cryptography.MD5]::Create()
+                $hashBytes = $md5.ComputeHash($imageBytes)
+                $currentImageHash = [System.BitConverter]::ToString($hashBytes) -replace '-'
+                $md5.Dispose()
+                
+                Write-DebugMsg "Current image hash: $currentImageHash, Last hash: $($script:lastClipboardImageHash)"
+                
+                if ($currentImageHash -eq $script:lastClipboardImageHash) {
+                    Write-DebugMsg "Image hash matches previous - skipping save and upload"
+                    $image.Dispose()
+                    continue
+                }
+                
+                # Hash is different, proceed with saving
                 Write-DebugMsg "About to get next file number for image"
                 $fileNumber = Get-NextFileNumber
                 $paddedNumber = $fileNumber.ToString().PadLeft(3, '0')
@@ -896,9 +969,17 @@ while ($true) {
                 
                 Write-DebugMsg "Creating image file: $filename"
                 
-                $image.Save($filename, [System.Drawing.Imaging.ImageFormat]::Png)
-                Write-Host "$(Get-Date -Format 'HH:mm:ss') - Image saved: $filename"
+                # Save the image bytes to file
+                [System.IO.File]::WriteAllBytes($filename, $imageBytes)
+                $script:lastClipboardImageHash = $currentImageHash
                 
+                # Upload image to WebDAV (use hostname-based file name)
+                $remoteImagePath = $NextcloudConfig.RemoteFolder + "clipboard-$hostname.png"
+                $uploadResult = Send-FileToNextcloud -Connection $webdavConnection -LocalFilePath $filename -RemoteFilePath $remoteImagePath
+                if ($uploadResult) {
+                    Write-Host "$(Get-Date -Format 'HH:mm:ss') - Uploaded image to WebDAV: $remoteImagePath"
+                }
+
                 # Show notification for image capture
                 Show-ClipboardNotification -Title "ClipSon" -Message "Image saved: $filename" -Icon "Info"
                 
