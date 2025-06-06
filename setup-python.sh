@@ -3,7 +3,7 @@
 
 echo "Installing system dependencies..."
 sudo apt update
-sudo apt install -y python3 python3-pip xclip libnotify-bin curl
+sudo apt install -y python3 python3-pip xclip libnotify-bin
 
 echo "Installing Python dependencies..."
 pip3 install -r requirements.txt

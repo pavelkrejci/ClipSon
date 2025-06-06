@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 ClipSon - Advanced Clipboard Synchronization Tool for Linux
-Dependencies: python3, xclip, notify-send (libnotify-bin), curl
-Install with: sudo apt install python3 xclip libnotify-bin curl
+Dependencies: python3, xclip, notify-send (libnotify-bin)
+Install with: sudo apt install python3 xclip libnotify-bin
 """
 
 import subprocess
