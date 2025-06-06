@@ -61,7 +61,7 @@ Nextcloud clipboard synchronization tool for Linux (Python) and Windows (PowerSh
 
 ```  
 "app": {
-        "max_history": 200, // Maximum number of clipboard entries to keep  
+        "max_history": 200, // Maximum number of clipboard entries in local cache (directory clipboard-captures)
         "remote_check_interval_seconds": 1, // Interval to check for remote changes
         "debug_enabled": false // Enable debug logging  
     }
