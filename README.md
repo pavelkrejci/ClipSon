@@ -27,7 +27,7 @@ Nextcloud clipboard synchronization tool for Linux (Python) and Windows (PowerSh
    ```
 2. Copy any text or image to clipboard
 3. Content will be automatically synced to Nextcloud
-4. Peers' clipboard syncs are regularly checked (parameter `remote_check_interval_seconds`), retrieved and copied to local system clipboard
+4. Peers' clipboard syncs are regularly checked (parameter `remote_check_interval_seconds`), retrieved and pushed to local system clipboard
 
 ### Linux (Python)
 
@@ -42,7 +42,7 @@ Nextcloud clipboard synchronization tool for Linux (Python) and Windows (PowerSh
    ```
 3. Copy any text or image to clipboard
 4. Content will be automatically saved and synced to Nextcloud
-5. Peers' clipboard syncs are regularly checked (parameter `remote_check_interval_seconds`), retrieved and copied to local system clipboard
+5. Peers' clipboard syncs are regularly checked (parameter `remote_check_interval_seconds`), retrieved and pushed to local system clipboard
 
 ## Configuration
 
