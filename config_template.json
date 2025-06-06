@@ -1,0 +1,19 @@
+{
+    "nextcloud": {
+        "server_url": "https://nextcloud.example.com/", 
+        "username": "john",
+        "password": "xxx",
+        "remote_folder": "ClipSon/"
+    },
+    "proxy": {
+        "url": "",
+        "username": "",
+        "password": "",
+        "use_system_proxy": true
+    },
+    "app": {
+        "max_history": 200,
+        "remote_check_interval_seconds": 1,
+        "debug_enabled": false
+    }
+}
