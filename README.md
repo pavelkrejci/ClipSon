@@ -58,10 +58,15 @@ Nextcloud clipboard synchronization tool for Linux (Python) and Windows (PowerSh
 
 ### Application Configuration
 - The `config.json` file contains application level tweaks:
+  
 "app": {
+
         "max_history": 200, # Maximum number of clipboard entries to keep
+  
         "remote_check_interval_seconds": 1, # Interval to check for remote changes
+  
         "debug_enabled": false # Enable debug logging
+  
     }
 
 ## Requirements
