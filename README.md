@@ -77,7 +77,7 @@ Nextcloud clipboard synchronization tool for Linux (Python) and Windows (PowerSh
 
 ## Files
 
-- [`config_template.json`](config.json) - Configuration file for Nextcloud credentials and WebDAV URL
+- [`config_template.json`](config_template.json) - Configuration file for Nextcloud credentials and WebDAV URL
 - [`clipson.ps1`](clipson.ps1) - Main PowerShell script for Windows
 - [`clipson.py`](clipson.py) - Main Python script for Linux (uses xclip for clipboard manipulation and notify-send for desktop notification)
 - [`requirements.txt`](requirements.txt) - Python dependencies
