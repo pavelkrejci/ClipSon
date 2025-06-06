@@ -84,7 +84,7 @@ Nextcloud clipboard synchronization tool for Linux (Python) and Windows (PowerSh
 - [`clipson.py`](clipson.py) - Main Python script for Linux (uses xclip for clipboard manipulation and notify-send for desktop notification)
 - [`requirements.txt`](requirements.txt) - Python dependencies
 - [`setup-python.sh`](setup-python.sh) - Linux dependencies setup script
-- `clipboard-captures/` - Output directory (created automatically)
+- `clipboard-captures/` - local clipboard captures history directory (created automatically)
 
 ## License
 
