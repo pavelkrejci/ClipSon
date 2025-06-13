@@ -817,9 +817,9 @@ class ClipSon:
         try:
             if DEBUG:
                 print(f"DEBUG: Setting {len(format_data)} clipboard formats (multi-mime)")
-
             # Build the argument list for copyq: [mime1, value1, mime2, value2, ...]
             args = ['copyq', 'copy']
+
             # Use a priority order for consistency
             set_priority = [
                 'text/plain', 'text/html', 'text/rtf', 'application/rtf', 'application/x-rtf',
@@ -827,6 +827,7 @@ class ClipSon:
                 'UTF8_STRING', 'STRING', 'TEXT'
             ]
             used = set()
+            
             for format_name in set_priority:
                 if format_name in format_data and format_name not in used:
                     args.append(format_name)
@@ -840,8 +841,21 @@ class ClipSon:
                     used.add(format_name)
 
             if DEBUG:
-                print(f"DEBUG: copyq args: {args}")
+                print(f"DEBUG: copyq arguments: {args[:200]}...")
 
+            # Check if total argument length would exceed system limits (e.g., 2MB)
+            total_args_length = sum(len(str(arg)) for arg in args)
+            if total_args_length > 2 * 1024 * 1024:  # 2MB limit
+                if DEBUG:
+                    print(f"DEBUG: Total arguments length ({total_args_length} bytes) exceeds 2MB limit, falling back to text/plain only")
+                # Fall back to setting only text/plain format
+                if 'text/plain' in format_data:
+                    return self.set_clipboard_content(format_data['text/plain'])
+                else:
+                    # Use the first available format
+                    first_format = next(iter(format_data.values()))
+                    return self.set_clipboard_content(first_format)
+                
             # Call copyq with all formats at once
             result = subprocess.run(args, check=True)
             if result.returncode == 0:
