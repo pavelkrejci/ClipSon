@@ -400,14 +400,48 @@ function global:Save-ClipboardRichContentJson {
                 Write-Host "  - $file"
             }
             
-            # Create multi-format upload content
+            # Create multi-format upload content with proper JSON escaping
+            $formatDataForJson = @{}
+            foreach ($format in $FormatData.Keys) {
+                $content = $FormatData[$format]
+                # Ensure content is properly handled for JSON serialization
+                if ($content -ne $null) {
+                    $formatDataForJson[$format] = $content.ToString()
+                }
+            }
+            
             $uploadContent = @{
                 type = "MULTI_FORMAT_CLIPBOARD"
-                formats = $FormatData  # Ensure consistent structure
+                formats = $formatDataForJson
             }
-            $uploadJson = ConvertTo-Json $uploadContent -Depth 10
             
-            # Upload to WebDAV - Fix: Pass all required parameters
+            # Use ConvertTo-Json with proper depth and ensure ASCII escaping for special characters
+            $uploadJson = ConvertTo-Json $uploadContent -Depth 10 -Compress:$false
+            
+            # Debug: Show JSON structure
+            if ($global:Config -and $global:Config.app.debug_enabled) {
+                Write-DebugMsg "JSON structure created, length: $($uploadJson.Length)"
+                Write-DebugMsg "JSON preview: $($uploadJson.Substring(0, [Math]::Min(200, $uploadJson.Length)))..."
+                
+                # Validate JSON by parsing it back
+                try {
+                    $testParse = ConvertFrom-Json $uploadJson
+                    Write-DebugMsg "JSON validation successful, formats in parsed JSON: $($testParse.formats.PSObject.Properties.Name -join ', ')"
+                    
+                    # Check RTF content specifically
+                    if ($testParse.formats.'text/rtf') {
+                        $rtfContent = $testParse.formats.'text/rtf'
+                        $hasRtfTags = $rtfContent -match '\\rtf' -and $rtfContent -match '\\par'
+                        Write-DebugMsg "RTF content validation: RTF tags present = $hasRtfTags"
+                        Write-DebugMsg "RTF content preview: $($rtfContent.Substring(0, [Math]::Min(100, $rtfContent.Length)))..."
+                    }
+                }
+                catch {
+                    Write-DebugMsg "JSON validation failed: $($_.Exception.Message)"
+                }
+            }
+            
+            # Upload to WebDAV
             Upload-ToWebDAV -Content $uploadJson -Connection $global:webdavConnection -LocalSyncFile $global:localSyncFile -LocalSyncFileGz $global:localSyncFileGz -RemoteFilePath $global:localUploadPath
             
             # Show notification

@@ -572,11 +572,38 @@ function global:Upload-ToWebDAV {
             return
         }
         
-        [System.IO.File]::WriteAllText($LocalSyncFile, $Content, [System.Text.Encoding]::UTF8)
+        # Validate JSON before upload
+        if ($global:Config -and $global:Config.app.debug_enabled) {
+            try {
+                $testParse = ConvertFrom-Json $Content
+                Write-DebugMsg "Pre-upload JSON validation successful"
+                if ($testParse.type -eq "MULTI_FORMAT_CLIPBOARD" -and $testParse.formats.'text/rtf') {
+                    $rtfPreview = $testParse.formats.'text/rtf'.Substring(0, [Math]::Min(50, $testParse.formats.'text/rtf'.Length))
+                    Write-DebugMsg "RTF content in upload: $rtfPreview..."
+                }
+            }
+            catch {
+                Write-DebugMsg "Pre-upload JSON validation failed: $($_.Exception.Message)"
+            }
+        }
+        
+        # Write with UTF-8 encoding without BOM
+        $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+        [System.IO.File]::WriteAllText($LocalSyncFile, $Content, $utf8NoBom)
         
         if (-not (Test-Path $LocalSyncFile)) {
             Write-Error "$(Get-Date -Format 'HH:mm:ss') - Failed to create local sync file: $LocalSyncFile"
             return
+        }
+        
+        # Verify written file
+        if ($global:Config -and $global:Config.app.debug_enabled) {
+            $writtenContent = [System.IO.File]::ReadAllText($LocalSyncFile, $utf8NoBom)
+            if ($writtenContent.Length -ne $Content.Length) {
+                Write-DebugMsg "WARNING: File length mismatch. Original: $($Content.Length), Written: $($writtenContent.Length)"
+            } else {
+                Write-DebugMsg "File written successfully, length verified: $($writtenContent.Length)"
+            }
         }
         
         if (Compress-JsonFile -JsonFile $LocalSyncFile -GzFile $LocalSyncFileGz) {

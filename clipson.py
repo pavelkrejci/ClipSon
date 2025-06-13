@@ -820,12 +820,13 @@ class ClipSon:
             # Build the argument list for copyq: [mime1, value1, mime2, value2, ...]
             args = ['copyq', 'copy']
 
-            # Use a priority order for consistency
+            #Use a priority order for consistency
             set_priority = [
                 'text/plain', 'text/html', 'text/rtf', 'application/rtf', 'application/x-rtf',
                 'text/richtext', 'text/uri-list', 'text/x-moz-url',
                 'UTF8_STRING', 'STRING', 'TEXT'
             ]
+            
             used = set()
             
             for format_name in set_priority:
@@ -833,15 +834,12 @@ class ClipSon:
                     args.append(format_name)
                     args.append(format_data[format_name])
                     used.add(format_name)
-            # Add any remaining formats not in priority list
-            for format_name in format_data:
-                if format_name not in used:
-                    args.append(format_name)
-                    args.append(format_data[format_name])
-                    used.add(format_name)
-
-            if DEBUG:
-                print(f"DEBUG: copyq arguments: {args[:200]}...")
+            # # Add any remaining formats not in priority list
+            # for format_name in format_data:
+            #     if format_name not in used:
+            #         args.append(format_name)
+            #         args.append(format_data[format_name])
+            #         used.add(format_name)            
 
             # Check if total argument length would exceed system limits (e.g., 2MB)
             total_args_length = sum(len(str(arg)) for arg in args)
