@@ -12,6 +12,7 @@ import sys
 import json
 import xml.etree.ElementTree as ET
 from datetime import datetime
+from datetime import timezone
 from pathlib import Path
 import requests
 from requests.auth import HTTPBasicAuth
@@ -19,6 +20,7 @@ import signal
 import getpass
 import gzip
 import base64
+import hashlib
 
 def load_configuration():
     """Load configuration from JSON file"""
@@ -43,7 +45,6 @@ CONFIG_DATA = load_configuration()
 
 # Global debug constant (now from config)
 DEBUG = CONFIG_DATA['app']['debug_enabled']
-
 
 # Configuration (now loaded from config.json)
 CONFIG = {
@@ -91,6 +92,10 @@ class ClipSon:
         
         # Setup signal handler
         signal.signal(signal.SIGINT, self.signal_handler)
+        
+        # Use copyq or fallback to xclip based on config
+        self.use_copyq = CONFIG_DATA['app'].get('use_copyq', True)
+        print(f"Using {'copyq' if self.use_copyq else 'xclip'} for clipboard operations.")
     
     def signal_handler(self, signum, frame):
         print("\nClipSon stopped.")
@@ -120,10 +125,12 @@ class ClipSon:
             print(f"NOTIFICATION: {title} - {message}")
     
     def get_clipboard_content(self):
-        """Get current clipboard content (text only)"""
+        """Get current clipboard content (text only) using copyq or xclip"""
         try:
-            result = subprocess.run(['xclip', '-selection', 'clipboard', '-o'], 
-                                  capture_output=True, text=True)
+            if self.use_copyq:
+                result = subprocess.run(['copyq', 'clipboard', 'text/plain'], capture_output=True, text=True)
+            else:
+                result = subprocess.run(['xclip', '-selection', 'clipboard', '-o'], capture_output=True, text=True)
             if result.returncode == 0 and result.stdout.strip():
                 return result.stdout
         except Exception:
@@ -131,16 +138,20 @@ class ClipSon:
         return None
 
     def has_clipboard_image(self):
-        """Check if clipboard contains an image"""
+        """Check if clipboard contains an image using copyq or xclip"""
         try:
-            # Check if clipboard has image data
-            result = subprocess.run(['xclip', '-selection', 'clipboard', '-t', 'TARGETS', '-o'], 
-                                  capture_output=True, text=True)
-            if result.returncode == 0:
-                targets = result.stdout.strip().split('\n')
-                # Look for image MIME types
-                image_targets = ['image/png', 'image/jpeg', 'image/gif', 'image/bmp', 'image/tiff']
-                return any(target.strip() in image_targets for target in targets)
+            if self.use_copyq:
+                result = subprocess.run(['copyq', 'clipboard', '?'], capture_output=True, text=True)
+                if result.returncode == 0:
+                    targets = result.stdout.strip().split('\n')
+                    image_targets = ['image/png', 'image/jpeg', 'image/gif', 'image/bmp', 'image/tiff']
+                    return any(target.strip() in image_targets for target in targets)
+            else:
+                result = subprocess.run(['xclip', '-selection', 'clipboard', '-t', 'TARGETS', '-o'], capture_output=True, text=True)
+                if result.returncode == 0:
+                    targets = result.stdout.strip().split('\n')
+                    image_targets = ['image/png', 'image/jpeg', 'image/gif', 'image/bmp', 'image/tiff']
+                    return any(target.strip() in image_targets for target in targets)
         except Exception:
             pass
         return False
@@ -194,7 +205,6 @@ class ClipSon:
             
             if result.returncode == 0 and result.stdout:
                 # Calculate hash from image data
-                import hashlib
                 current_image_hash = hashlib.md5(result.stdout).hexdigest()
                 
                 # Check if this is the same image as last time
@@ -216,8 +226,7 @@ class ClipSon:
                 self.last_image_hash = current_image_hash
                 
                 # Create unified JSON format for image
-                import base64
-                import json
+
                 image_b64 = base64.b64encode(result.stdout).decode('utf-8')
                 upload_content = {
                     "type": "CLIPBOARD_IMAGE",
@@ -302,7 +311,6 @@ class ClipSon:
                         last_modified = None
                         if lastmodified_elem is not None and lastmodified_elem.text:
                             try:
-                                from datetime import timezone
                                 # Parse without timezone first, then make it UTC
                                 dt_str = lastmodified_elem.text.replace(' GMT', '')
                                 last_modified_utc = datetime.strptime(dt_str, '%a, %d %b %Y %H:%M:%S')
@@ -379,7 +387,6 @@ class ClipSon:
                 root = ET.fromstring(response.text)
                 lastmodified_elem = root.find('.//{DAV:}getlastmodified')
                 if lastmodified_elem is not None and lastmodified_elem.text:
-                    from datetime import timezone
                     # Parse without timezone first, then make it UTC
                     dt_str = lastmodified_elem.text.replace(' GMT', '')
                     last_modified_utc = datetime.strptime(dt_str, '%a, %d %b %Y %H:%M:%S')
@@ -491,19 +498,25 @@ class ClipSon:
                         self.remote_file_timestamps[filename] = remote_timestamp
                         
                         # Clean up temp files
-                        for temp_file in [temp_download_file_gz, temp_download_file_json]:
-                            try:
-                                os.remove(temp_file)
-                            except:
-                                pass
+                        if not DEBUG:
+                            for temp_file in [temp_download_file_gz, temp_download_file_json]:
+                                try:
+                                    os.remove(temp_file)
+                                except:
+                                    pass
+                        else:
+                            print(f"DEBUG: Keeping temp files for inspection: {temp_download_file_gz}, {temp_download_file_json}")
                                 
                     except Exception as e:
                         print(f"Error processing {filename}: {e}")
-                        for temp_file in [temp_download_file_gz, temp_download_file_json]:
-                            try:
-                                os.remove(temp_file)
-                            except:
-                                pass
+                        if not DEBUG:
+                            for temp_file in [temp_download_file_gz, temp_download_file_json]:
+                                try:
+                                    os.remove(temp_file)
+                                except:
+                                    pass
+                        else:
+                            print(f"DEBUG: Keeping temp files for inspection after error: {temp_download_file_gz}, {temp_download_file_json}")
         
         # Apply the most recent update if found
         if most_recent_content:
@@ -522,35 +535,50 @@ class ClipSon:
     def set_clipboard_content_unified(self, content):
         """Set clipboard content from unified JSON format"""
         try:
-            # Check if this is JSON content
-            if content.strip().startswith('{'):
-                import json
-                try:
-                    data = json.loads(content)
-                    content_type = data.get("type")
-                    
-                    if content_type == "CLIPBOARD_IMAGE":
-                        # Handle image content
-                        import base64
-                        image_data = base64.b64decode(data["data"])
-                        return self.set_clipboard_image(image_data)
-                    
-                    elif content_type == "MULTI_FORMAT_CLIPBOARD":
-                        # Handle multi-format text content
-                        if "formats" in data:
-                            return self.set_clipboard_multiple_formats(data["formats"])
-                    
-                    elif content_type == "PLAIN_TEXT":
-                        # Handle plain text content
-                        if "content" in data:
-                            return self.set_clipboard_content(data["content"])
-                    
-                except json.JSONDecodeError:
-                    pass
-            
-            # Fall back to legacy or plain text handling
-            return self.set_clipboard_rich_content(content)
+            # Always try to parse JSON if it looks like JSON            
+            if DEBUG:
+                print(f"DEBUG: set_clipboard_content_unified received JSON: {content[:120]}{'...' if len(content) > 120 else ''}")
+            # Handle possible BOM (Byte Order Mark) at the start of content
+            if content and ord(content[0]) == 0xFEFF:
+                if DEBUG:
+                    print("DEBUG: Detected UTF-8 BOM, stripping it before parsing JSON.")
+                content = content.lstrip('\ufeff')
+            try:
+                data = json.loads(content)
+                content_type = data.get("type")
+                if DEBUG:
+                    print(f"DEBUG: Parsed JSON type: {content_type}, keys: {list(data.keys())}")
                 
+                if content_type == "CLIPBOARD_IMAGE":
+                    # Handle image content
+                    image_data = base64.b64decode(data["data"])
+                    if DEBUG:
+                        print(f"DEBUG: Decoded image data, length: {len(image_data)}")
+                    return self.set_clipboard_image(image_data)
+                
+                elif content_type == "MULTI_FORMAT_CLIPBOARD":
+                    if "formats" in data:
+                        if DEBUG:
+                            print(f"DEBUG: MULTI_FORMAT_CLIPBOARD formats: {list(data['formats'].keys())}")
+                        return self.set_clipboard_multiple_formats(data["formats"])
+                
+                elif content_type == "PLAIN_TEXT":
+                    if "content" in data:
+                        if DEBUG:
+                            print(f"DEBUG: PLAIN_TEXT content: {repr(data['content'])}")
+                        return self.set_clipboard_content(data["content"])
+                    else:
+                        if DEBUG:
+                            print("DEBUG: PLAIN_TEXT but no content field, setting empty string")
+                        return self.set_clipboard_content("")
+            except Exception as e:
+                print(f"DEBUG: Failed to parse JSON clipboard content: {e}")
+                # Fallback to legacy or plain text handling below
+
+            # Fall back to legacy or plain text handling
+            if DEBUG:
+                print(f"DEBUG: set_clipboard_content_unified fallback, content: {content[:120]}{'...' if len(content) > 120 else ''}")
+            return self.set_clipboard_rich_content(content)
         except Exception as e:
             print(f"Error setting unified clipboard content: {e}")
             return self.set_clipboard_content(content)
@@ -559,14 +587,11 @@ class ClipSon:
         """Update last_clipboard_content from remote content to prevent re-capture"""
         try:
             if content.strip().startswith('{'):
-                import json
                 data = json.loads(content)
                 content_type = data.get("type")
                 
                 if content_type == "CLIPBOARD_IMAGE":
                     # Store comparison format for images (without data to save memory)
-                    import hashlib
-                    import base64
                     image_data = base64.b64decode(data["data"])
                     image_hash = hashlib.md5(image_data).hexdigest()
                     self.last_image_hash = image_hash  # Update hash tracking
@@ -631,38 +656,45 @@ class ClipSon:
         self.show_notification("ClipSon", f"Captured: {preview}")
     
     def set_clipboard_content(self, content):
-        """Set clipboard content"""
+        """Set clipboard content using copyq or xclip"""
         try:
-            subprocess.run(['xclip', '-selection', 'clipboard'], 
-                          input=content, text=True, check=True)
-            return True
+            if self.use_copyq:
+                result = subprocess.run(['copyq', 'copy', 'text/plain', content], check=True)
+                return result.returncode == 0
+            else:
+                result = subprocess.run(['xclip', '-selection', 'clipboard'], input=content, text=True, check=True)
+                return result.returncode == 0
         except Exception:
             return False
 
     def set_clipboard_image(self, image_data):
-        """Set clipboard image content"""
+        """Set clipboard image content using copyq or xclip"""
         try:
             # Update hash tracking immediately to prevent re-capture
-            import hashlib
             self.last_image_hash = hashlib.md5(image_data).hexdigest()
             if DEBUG:
                 print(f"DEBUG: Updated last_image_hash to prevent re-capture: {self.last_image_hash}")
-            
-            # Use xclip to set image data to clipboard
-            subprocess.run(['xclip', '-selection', 'clipboard', '-t', 'image/png'], 
-                          input=image_data, check=True)
-            return True
+            if self.use_copyq:
+                result = subprocess.run(['copyq', 'copy', 'image/png', '-'], input=image_data, check=True)
+                return result.returncode == 0
+            else:
+                result = subprocess.run(['xclip', '-selection', 'clipboard', '-t', 'image/png'], input=image_data, check=True)
+                return result.returncode == 0
         except Exception as e:
             print(f"Error setting clipboard image: {e}")
             return False
 
     def get_clipboard_formats(self):
-        """Get available clipboard formats"""
+        """Get available clipboard formats using copyq or xclip"""
         try:
-            result = subprocess.run(['xclip', '-selection', 'clipboard', '-t', 'TARGETS', '-o'], 
-                                  capture_output=True, text=True)
-            if result.returncode == 0:
-                return result.stdout.strip().split('\n')
+            if self.use_copyq:
+                result = subprocess.run(['copyq', 'clipboard', '?'], capture_output=True, text=True)
+                if result.returncode == 0:
+                    return result.stdout.strip().split('\n')
+            else:
+                result = subprocess.run(['xclip', '-selection', 'clipboard', '-t', 'TARGETS', '-o'], capture_output=True, text=True)
+                if result.returncode == 0:
+                    return result.stdout.strip().split('\n')
         except Exception:
             pass
         return []
@@ -692,11 +724,11 @@ class ClipSon:
 
             file_number = self.get_next_file_number()
             base_filename = self.output_dir / f"clipboard_rich_{file_number:03d}"
-            
+
             saved_files = []
             format_data = {}  # Store all format data for multi-format upload
             seen_content = set()  # Track content to avoid duplicates
-            
+
             # Priority order for formats with unique filenames
             # text/plain first for better cross-platform compatibility
             format_priority = [
@@ -712,7 +744,7 @@ class ClipSon:
                 ('STRING', '.string'),         # Linux-specific
                 ('TEXT', '.text')              # Linux-specific
             ]
-            
+
             for format_name, extension in format_priority:
                 if format_name.strip() in formats:
                     try:
@@ -745,17 +777,16 @@ class ClipSon:
                         if DEBUG:
                             print(f"DEBUG: Failed to save format {format_name}: {e}")
                         continue
-            
+
             if saved_files and format_data:
                 print(f"{datetime.now().strftime('%H:%M:%S')} - Rich content saved: {len(saved_files)} unique formats")
                 for filename in saved_files:
                     print(f"  - {filename}")
                 
                 # Create multi-format upload content
-                import json
                 upload_content = {
                     "type": "MULTI_FORMAT_CLIPBOARD",
-                    "formats": format_data
+                    "formats": format_data  # Ensure consistent structure
                 }
                 upload_json = json.dumps(upload_content, ensure_ascii=False, indent=2)
                 
@@ -782,65 +813,58 @@ class ClipSon:
         return False
 
     def set_clipboard_multiple_formats(self, format_data):
-        """Set multiple clipboard formats simultaneously"""
+        """Set multiple clipboard formats simultaneously using copyq"""
         try:
             if DEBUG:
-                print(f"DEBUG: Setting {len(format_data)} clipboard formats")
-            
-            # Priority order for setting formats (most important first)
-            # Prioritize cross-platform compatible formats
+                print(f"DEBUG: Setting {len(format_data)} clipboard formats (multi-mime)")
+
+            # Build the argument list for copyq: [mime1, value1, mime2, value2, ...]
+            args = ['copyq', 'copy']
+            # Use a priority order for consistency
             set_priority = [
-                'text/plain',           # Best cross-platform compatibility
-                'text/html', 
-                'text/rtf', 
-                'application/rtf', 
-                'application/x-rtf', 
-                'text/richtext', 
-                'text/uri-list', 
-                'text/x-moz-url',
-                'UTF8_STRING',          # Linux fallbacks
-                'STRING', 
-                'TEXT'
+                'text/plain', 'text/html', 'text/rtf', 'application/rtf', 'application/x-rtf',
+                'text/richtext', 'text/uri-list', 'text/x-moz-url',
+                'UTF8_STRING', 'STRING', 'TEXT'
             ]
-            
-            success_count = 0
-            
-            # Try to set each format in priority order
+            used = set()
             for format_name in set_priority:
-                if format_name in format_data:
-                    try:
-                        content = format_data[format_name]
-                        # Use separate xclip calls to set each format
-                        result = subprocess.run([
-                            'xclip', '-selection', 'clipboard', '-t', format_name
-                        ], input=content, text=True, check=False)
-                        
-                        if result.returncode == 0:
-                            success_count += 1
-                            if DEBUG:
-                                print(f"DEBUG: Successfully set format {format_name}")
-                        else:
-                            if DEBUG:
-                                print(f"DEBUG: Failed to set format {format_name}")
-                    except Exception as e:
-                        if DEBUG:
-                            print(f"DEBUG: Error setting format {format_name}: {e}")
-            
+                if format_name in format_data and format_name not in used:
+                    args.append(format_name)
+                    args.append(format_data[format_name])
+                    used.add(format_name)
+            # Add any remaining formats not in priority list
+            for format_name in format_data:
+                if format_name not in used:
+                    args.append(format_name)
+                    args.append(format_data[format_name])
+                    used.add(format_name)
+
             if DEBUG:
-                print(f"DEBUG: Successfully set {success_count}/{len(format_data)} formats")
-            
-            return success_count > 0
-            
+                print(f"DEBUG: copyq args: {args}")
+
+            # Call copyq with all formats at once
+            result = subprocess.run(args, check=True)
+            if result.returncode == 0:
+                if DEBUG:
+                    print("DEBUG: Successfully set multiple formats with copyq")
+                return True
+            else:
+                if DEBUG:
+                    print("DEBUG: copyq returned non-zero exit code")
+                return False
         except Exception as e:
             print(f"Error setting multiple clipboard formats: {e}")
             return False
 
     def set_clipboard_format(self, content, format_type):
-        """Set clipboard content with specific format"""
+        """Set clipboard content with specific format using copyq or xclip"""
         try:
-            subprocess.run(['xclip', '-selection', 'clipboard', '-t', format_type], 
-                          input=content, text=True, check=True)
-            return True
+            if self.use_copyq:
+                result = subprocess.run(['copyq', 'copy', format_type, content], check=True)
+                return result.returncode == 0
+            else:
+                result = subprocess.run(['xclip', '-selection', 'clipboard', '-t', format_type], input=content, text=True, check=True)
+                return result.returncode == 0
         except Exception as e:
             print(f"Error setting clipboard format {format_type}: {e}")
             return False
@@ -905,10 +929,7 @@ class ClipSon:
         
         while True:
             try:
-                # Import json at the top to avoid scope issues
-                import json
-                import hashlib
-                
+                # Import json at the top to avoid scope issues                                
                 # Check all remote files for updates
                 remote_content = self.check_all_remote_files_for_updates()
                 # Note: last_clipboard_content is already updated inside check_all_remote_files_for_updates()
