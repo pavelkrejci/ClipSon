@@ -377,10 +377,22 @@ function global:Save-ClipboardRichContentJson {
         $baseFilename = "$outputDir\clipboard_rich_$($fileNumber.ToString().PadLeft(3, '0'))"
         
         $savedFiles = @()
+        # Build a new hashtable for processed content
+        $formatDataForJson = @{}
         
         # Save each available format to individual files
         foreach ($format in $FormatData.Keys) {
             $content = $FormatData[$format]
+            # Strip Windows clipboard HTML header if present
+            # TODO not quite right, but works for now
+            if ($format -eq 'text/html' -and $content -is [string]) {
+                if ($content -match "(?s)StartFragment:(\d+).*EndFragment:(\d+)") {
+                    $startFragment = [int]$matches[1]
+                    $endFragment = [int]$matches[2]
+                    $content = $content.Substring($startFragment, $endFragment - $startFragment)
+                    Write-DebugMsg "Stripped clipboard HTML header, using only HTML fragment."
+                }
+            }
             $extension = switch ($format) {
                 'text/html' { '.html' }
                 'text/rtf' { '.rtf' }
@@ -392,24 +404,17 @@ function global:Save-ClipboardRichContentJson {
             [System.IO.File]::WriteAllText($filename, $content, $utf8NoBom)
             $savedFiles += $filename
             Write-DebugMsg "Saved $format to $filename"
+            # Add processed content to new hashtable
+            $formatDataForJson[$format] = $content
         }
         
         if ($savedFiles.Count -gt 0) {
-            Write-Host "$(Get-Date -Format 'HH:mm:ss') - Rich content saved: $($savedFiles.Count) unique formats"
+            Write-Host "$(Get-Date -Format 'HH:mm:ss.fff') - Rich content saved: $($savedFiles.Count) unique formats"
             foreach ($file in $savedFiles) {
                 Write-Host "  - $file"
             }
             
             # Create multi-format upload content with proper JSON escaping
-            $formatDataForJson = @{}
-            foreach ($format in $FormatData.Keys) {
-                $content = $FormatData[$format]
-                # Ensure content is properly handled for JSON serialization
-                if ($content -ne $null) {
-                    $formatDataForJson[$format] = $content.ToString()
-                }
-            }
-            
             $uploadContent = @{
                 type = "MULTI_FORMAT_CLIPBOARD"
                 formats = $formatDataForJson

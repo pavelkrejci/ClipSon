@@ -65,13 +65,19 @@ def get_password_if_needed():
         CONFIG['password'] = password
         print("Password configured successfully.")
 
+def debug_print(message):
+    """Print debug message with timestamp if DEBUG is enabled"""
+    if DEBUG:
+        timestamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]  # Include milliseconds
+        print(f"[DEBUG {timestamp}] {message}")
+
 class ClipSon:
     def __init__(self):
         # Get password if needed before setting up WebDAV
         get_password_if_needed()
         
         self.hostname = os.uname().nodename
-        self.output_dir = Path(f'./clipboard-captures')
+        self.output_dir = Path(f'./captures-{self.hostname}')
         self.output_dir.mkdir(exist_ok=True)
         
         self.max_history = CONFIG_DATA['app']['max_history']
@@ -80,6 +86,7 @@ class ClipSon:
         self.remote_file_timestamps = {}  # Track timestamps for each remote file
         self.last_remote_check = 0
         self.remote_check_interval = CONFIG_DATA['app']['remote_check_interval_seconds']  # seconds
+        self.first_clipboard_capture = True  # Flag to skip sync on first capture
         
         # WebDAV setup
         self.webdav_base_url = f"{CONFIG['server_url'].rstrip('/')}/remote.php/dav/files/{CONFIG['username']}/"
@@ -95,8 +102,19 @@ class ClipSon:
         
         # Use copyq or fallback to xclip based on config
         self.use_copyq = CONFIG_DATA['app'].get('use_copyq', True)
-        print(f"Using {'copyq' if self.use_copyq else 'xclip'} for clipboard operations.")
-    
+        
+        # Check copyq daemon connection if enabled
+        if self.use_copyq:
+            if self.check_copyq_daemon():
+                print(f"Using copyq for clipboard operations (daemon running).")
+            else:
+                print("Warning: copyq daemon not responding, falling back to xclip.")
+                print("Tip: You can manually start copyq daemon with: copyq &")
+                self.use_copyq = False
+        
+        if not self.use_copyq:
+            print(f"Using xclip for clipboard operations.")
+
     def signal_handler(self, signum, frame):
         print("\nClipSon stopped.")
         sys.exit(0)
@@ -170,14 +188,12 @@ class ClipSon:
                         original_size += len(chunk)
             
             compressed_size = gz_file.stat().st_size
-            if DEBUG:
-                ratio = (1 - compressed_size / original_size) * 100 if original_size > 0 else 0
-                print(f"DEBUG: File compression {original_size} -> {compressed_size} bytes ({ratio:.1f}% saved)")
+            ratio = (1 - compressed_size / original_size) * 100 if original_size > 0 else 0
+            debug_print(f"File compression {original_size} -> {compressed_size} bytes ({ratio:.1f}% saved)")
             
             return True
         except Exception as e:
-            if DEBUG:
-                print(f"DEBUG: File compression failed: {e}")
+            debug_print(f"File compression failed: {e}")
             return False
 
     def decompress_gz_file(self, gz_file, json_file):
@@ -192,8 +208,7 @@ class ClipSon:
                         f_out.write(chunk)
             return True
         except Exception as e:
-            if DEBUG:
-                print(f"DEBUG: File decompression failed: {e}")
+            debug_print(f"File decompression failed: {e}")
             return False
 
     def save_clipboard_image(self):
@@ -209,8 +224,7 @@ class ClipSon:
                 
                 # Check if this is the same image as last time
                 if hasattr(self, 'last_image_hash') and current_image_hash == self.last_image_hash:
-                    if DEBUG:
-                        print(f"DEBUG: Image hash matches previous - skipping save and upload")
+                    debug_print(f"Image hash matches previous - skipping save and upload")
                     return False
                 
                 # Hash is different, proceed with saving
@@ -225,35 +239,31 @@ class ClipSon:
                 # Update hash tracking
                 self.last_image_hash = current_image_hash
                 
-                # Create unified JSON format for image
-
-                image_b64 = base64.b64encode(result.stdout).decode('utf-8')
-                upload_content = {
-                    "type": "CLIPBOARD_IMAGE",
-                    "data": image_b64,
-                    "format": "png",
-                    "size": len(result.stdout)
-                }
-                upload_json = json.dumps(upload_content, ensure_ascii=False, indent=2)
-                
-                # Save to local sync file, compress, and upload
-                with open(self.local_sync_file, 'w', encoding='utf-8') as f:
-                    f.write(upload_json)
-                
-                if self.compress_json_file(self.local_sync_file, self.local_sync_file_gz):
-                    if self.upload_to_webdav(self.local_sync_file_gz, self.local_upload_file):
-                        print(f"{datetime.now().strftime('%H:%M:%S')} - Uploaded compressed image to WebDAV: {self.local_upload_file}")
+                # Skip sync on first clipboard capture after app start
+                if self.first_clipboard_capture:
+                    self.first_clipboard_capture = False
+                    print(f"{datetime.now().strftime('%H:%M:%S')} - Skipping sync for first clipboard capture")
+                else:
+                    # Create unified JSON format for image
+                    image_b64 = base64.b64encode(result.stdout).decode('utf-8')
+                    upload_content = {
+                        "type": "CLIPBOARD_IMAGE",
+                        "data": image_b64,
+                        "format": "png",
+                        "size": len(result.stdout)
+                    }
+                    upload_json = json.dumps(upload_content, ensure_ascii=False, indent=2)
+                    
+                    # Save to local sync file, compress, and upload
+                    with open(self.local_sync_file, 'w', encoding='utf-8') as f:
+                        f.write(upload_json)
+                    
+                    if self.compress_json_file(self.local_sync_file, self.local_sync_file_gz):
+                        if self.upload_to_webdav(self.local_sync_file_gz, self.local_upload_file):
+                            print(f"{datetime.now().strftime('%H:%M:%S')} - Uploaded compressed image to WebDAV: {self.local_upload_file}")
                 
                 # Show notification
                 self.show_notification("ClipSon", f"Image captured: {filename}")
-                
-                # Update last clipboard content for comparison (without data field to save memory)
-                self.last_clipboard_content = json.dumps({
-                    "type": "CLIPBOARD_IMAGE",
-                    "format": "png",
-                    "size": len(result.stdout),
-                    "hash": current_image_hash
-                }, ensure_ascii=False, sort_keys=True)
                 
                 return True
         except Exception as e:
@@ -292,8 +302,7 @@ class ClipSon:
             
             if response.status_code != 207:
                 print(f"Failed to discover remote clipboard files: {response.status_code} {response.reason}")
-                if DEBUG:
-                    print(f"DEBUG: Response text: {response.text}")
+                debug_print(f"Response text: {response.text}")
                 return []                    
             
             # Parse XML response
@@ -340,12 +349,11 @@ class ClipSon:
         base = f"clipboard-{self.hostname}"
         peer_files = [f for f in remote_files if f['name'] != f"{base}.json.gz"]
         
-        if DEBUG:
-            print(f"DEBUG: Total remote files found: {len(remote_files)}")
-            print(f"DEBUG: My hostname: {self.hostname}")
-            print(f"DEBUG: My file: {base}.json.gz")
-            print(f"DEBUG: All remote files: {[f['name'] for f in remote_files]}")
-            print(f"DEBUG: Filtered peer files count: {len(peer_files)}")
+        debug_print(f"Total remote files found: {len(remote_files)}")
+        debug_print(f"My hostname: {self.hostname}")
+        debug_print(f"My file: {base}.json.gz")
+        debug_print(f"All remote files: {[f['name'] for f in remote_files]}")
+        debug_print(f"Filtered peer files count: {len(peer_files)}")
         
         if not peer_files:
             print("No remote clipboard files from other machines found.")
@@ -445,8 +453,7 @@ class ClipSon:
         # Only look for .json.gz files now
         peer_files = [f for f in remote_files if f['name'] != f"{base}.json.gz" and f['name'].startswith('clipboard-') and f['name'].endswith('.json.gz')]
         
-        if DEBUG:
-            print(f"DEBUG: Remote check - Total files: {len(remote_files)}, My file: {base}.json.gz, Peer files: {len(peer_files)}")
+        debug_print(f"Remote check - Total files: {len(remote_files)}, My file: {base}.json.gz, Peer files: {len(peer_files)}")
         
         most_recent_content = None
         most_recent_timestamp = 0
@@ -505,7 +512,7 @@ class ClipSon:
                                 except:
                                     pass
                         else:
-                            print(f"DEBUG: Keeping temp files for inspection: {temp_download_file_gz}, {temp_download_file_json}")
+                            debug_print(f"Keeping temp files for inspection: {temp_download_file_gz}, {temp_download_file_json}")
                                 
                     except Exception as e:
                         print(f"Error processing {filename}: {e}")
@@ -516,109 +523,26 @@ class ClipSon:
                                 except:
                                     pass
                         else:
-                            print(f"DEBUG: Keeping temp files for inspection after error: {temp_download_file_gz}, {temp_download_file_json}")
+                            debug_print(f"Keeping temp files for inspection after error: {temp_download_file_gz}, {temp_download_file_json}")
         
         # Apply the most recent update if found
         if most_recent_content:
             if self.set_clipboard_content_unified(most_recent_content):
+                # Get the actual clipboard fingerprint after setting content
+                # This ensures our comparison data matches what's actually in the clipboard
+                actual_fingerprint = self.get_current_clipboard_fingerprint()
+                
+                self.last_clipboard_content = actual_fingerprint
+                debug_print(f"Updated last_clipboard_content with actual fingerprint: {actual_fingerprint}")
+                
                 # Show notification
                 preview = most_recent_content[:50] + "..." if len(most_recent_content) > 50 else most_recent_content
                 self.show_notification("ClipSon", f"Remote update from {most_recent_filename}: {preview}")
-                
-                # Set last_clipboard_content based on content type to prevent re-capture
-                self.update_last_clipboard_content_from_remote(most_recent_content)
-            
             return most_recent_content
         
         return None
 
-    def set_clipboard_content_unified(self, content):
-        """Set clipboard content from unified JSON format"""
-        try:
-            # Always try to parse JSON if it looks like JSON            
-            if DEBUG:
-                print(f"DEBUG: set_clipboard_content_unified received JSON: {content[:120]}{'...' if len(content) > 120 else ''}")
-            # Handle possible BOM (Byte Order Mark) at the start of content
-            if content and ord(content[0]) == 0xFEFF:
-                if DEBUG:
-                    print("DEBUG: Detected UTF-8 BOM, stripping it before parsing JSON.")
-                content = content.lstrip('\ufeff')
-            try:
-                data = json.loads(content)
-                content_type = data.get("type")
-                if DEBUG:
-                    print(f"DEBUG: Parsed JSON type: {content_type}, keys: {list(data.keys())}")
-                
-                if content_type == "CLIPBOARD_IMAGE":
-                    # Handle image content
-                    image_data = base64.b64decode(data["data"])
-                    if DEBUG:
-                        print(f"DEBUG: Decoded image data, length: {len(image_data)}")
-                    return self.set_clipboard_image(image_data)
-                
-                elif content_type == "MULTI_FORMAT_CLIPBOARD":
-                    if "formats" in data:
-                        if DEBUG:
-                            print(f"DEBUG: MULTI_FORMAT_CLIPBOARD formats: {list(data['formats'].keys())}")
-                        return self.set_clipboard_multiple_formats(data["formats"])
-                
-                elif content_type == "PLAIN_TEXT":
-                    if "content" in data:
-                        if DEBUG:
-                            print(f"DEBUG: PLAIN_TEXT content: {repr(data['content'])}")
-                        return self.set_clipboard_content(data["content"])
-                    else:
-                        if DEBUG:
-                            print("DEBUG: PLAIN_TEXT but no content field, setting empty string")
-                        return self.set_clipboard_content("")
-            except Exception as e:
-                print(f"DEBUG: Failed to parse JSON clipboard content: {e}")
-                # Fallback to legacy or plain text handling below
-
-            # Fall back to legacy or plain text handling
-            if DEBUG:
-                print(f"DEBUG: set_clipboard_content_unified fallback, content: {content[:120]}{'...' if len(content) > 120 else ''}")
-            return self.set_clipboard_rich_content(content)
-        except Exception as e:
-            print(f"Error setting unified clipboard content: {e}")
-            return self.set_clipboard_content(content)
-
-    def update_last_clipboard_content_from_remote(self, content):
-        """Update last_clipboard_content from remote content to prevent re-capture"""
-        try:
-            if content.strip().startswith('{'):
-                data = json.loads(content)
-                content_type = data.get("type")
-                
-                if content_type == "CLIPBOARD_IMAGE":
-                    # Store comparison format for images (without data to save memory)
-                    image_data = base64.b64decode(data["data"])
-                    image_hash = hashlib.md5(image_data).hexdigest()
-                    self.last_image_hash = image_hash  # Update hash tracking
-                    self.last_clipboard_content = json.dumps({
-                        "type": "CLIPBOARD_IMAGE",
-                        "format": data.get("format", "png"),
-                        "size": data.get("size", len(image_data)),
-                        "hash": image_hash
-                    }, ensure_ascii=False, sort_keys=True)
-                
-                elif content_type == "MULTI_FORMAT_CLIPBOARD" and "formats" in data:
-                    # Store in comparison format (same as we use in main loop)
-                    self.last_clipboard_content = json.dumps({"formats": data["formats"]}, ensure_ascii=False, sort_keys=True)
-                
-                elif content_type == "PLAIN_TEXT" and "content" in data:
-                    # Store plain text content for comparison
-                    self.last_clipboard_content = data["content"]
-                
-                else:
-                    self.last_clipboard_content = content
-            else:
-                # Regular text or legacy rich content
-                self.last_clipboard_content = content
-                
-        except Exception:
-            self.last_clipboard_content = content
-
+    
     def get_next_file_number(self):
         """Get next file number for rotation"""
         self.file_counter += 1
@@ -637,19 +561,24 @@ class ClipSon:
         
         print(f"{datetime.now().strftime('%H:%M:%S')} - Text saved: {filename}")
         
-        # Save to local sync file and upload (content wrapped in JSON for consistency)
-        upload_content = {
-            "type": "PLAIN_TEXT",
-            "content": content
-        }
-        upload_json = json.dumps(upload_content, ensure_ascii=False, indent=2)
-        
-        with open(self.local_sync_file, 'w', encoding='utf-8') as f:
-            f.write(upload_json)
-        
-        # Compress and upload
-        if self.compress_json_file(self.local_sync_file, self.local_sync_file_gz):
-            self.upload_to_webdav(self.local_sync_file_gz, self.local_upload_file)
+        # Skip sync on first clipboard capture after app start
+        if self.first_clipboard_capture:
+            self.first_clipboard_capture = False
+            print(f"{datetime.now().strftime('%H:%M:%S')} - Skipping sync for first clipboard capture")
+        else:
+            # Save to local sync file and upload (content wrapped in JSON for consistency)
+            upload_content = {
+                "type": "PLAIN_TEXT",
+                "content": content
+            }
+            upload_json = json.dumps(upload_content, ensure_ascii=False, indent=2)
+            
+            with open(self.local_sync_file, 'w', encoding='utf-8') as f:
+                f.write(upload_json)
+            
+            # Compress and upload
+            if self.compress_json_file(self.local_sync_file, self.local_sync_file_gz):
+                self.upload_to_webdav(self.local_sync_file_gz, self.local_upload_file)
         
         # Show notification
         preview = content[:50] + "..." if len(content) > 50 else content
@@ -672,8 +601,7 @@ class ClipSon:
         try:
             # Update hash tracking immediately to prevent re-capture
             self.last_image_hash = hashlib.md5(image_data).hexdigest()
-            if DEBUG:
-                print(f"DEBUG: Updated last_image_hash to prevent re-capture: {self.last_image_hash}")
+            debug_print(f"Updated last_image_hash to prevent re-capture: {self.last_image_hash}")
             if self.use_copyq:
                 result = subprocess.run(['copyq', 'copy', 'image/png', '-'], input=image_data, check=True)
                 return result.returncode == 0
@@ -739,10 +667,7 @@ class ClipSon:
                 ('application/x-rtf', '.x-rtf'),
                 ('text/richtext', '.richtext'),
                 ('text/uri-list', '.uri'),
-                ('text/x-moz-url', '.url'),
-                ('UTF8_STRING', '.utf8'),      # Linux-specific but good fallback
-                ('STRING', '.string'),         # Linux-specific
-                ('TEXT', '.text')              # Linux-specific
+                ('text/x-moz-url', '.url'),                
             ]
 
             for format_name, extension in format_priority:
@@ -757,8 +682,7 @@ class ClipSon:
                             
                             # Skip if we've already seen this exact content
                             if content in seen_content:
-                                if DEBUG:
-                                    print(f"DEBUG: Skipping duplicate content for {format_name}")
+                                debug_print(f"Skipping duplicate content for {format_name}")
                                 continue
                             
                             seen_content.add(content)
@@ -770,12 +694,10 @@ class ClipSon:
                             saved_files.append(filename)
                             format_data[format_name] = content
                             
-                            if DEBUG:
-                                print(f"DEBUG: Saved {format_name} to {filename}")
+                            debug_print(f"Saved {format_name} to {filename}")
                                 
                     except Exception as e:
-                        if DEBUG:
-                            print(f"DEBUG: Failed to save format {format_name}: {e}")
+                        debug_print(f"Failed to save format {format_name}: {e}")
                         continue
 
             if saved_files and format_data:
@@ -783,27 +705,29 @@ class ClipSon:
                 for filename in saved_files:
                     print(f"  - {filename}")
                 
-                # Create multi-format upload content
-                upload_content = {
-                    "type": "MULTI_FORMAT_CLIPBOARD",
-                    "formats": format_data  # Ensure consistent structure
-                }
-                upload_json = json.dumps(upload_content, ensure_ascii=False, indent=2)
-                
-                # Save to local sync file, compress, and upload
-                with open(self.local_sync_file, 'w', encoding='utf-8') as f:
-                    f.write(upload_json)
-                
-                if self.compress_json_file(self.local_sync_file, self.local_sync_file_gz):
-                    self.upload_to_webdav(self.local_sync_file_gz, self.local_upload_file)
+                # Skip sync on first clipboard capture after app start
+                if self.first_clipboard_capture:
+                    self.first_clipboard_capture = False
+                    print(f"{datetime.now().strftime('%H:%M:%S')} - Skipping sync for first clipboard capture")
+                else:
+                    # Create multi-format upload content
+                    upload_content = {
+                        "type": "MULTI_FORMAT_CLIPBOARD",
+                        "formats": format_data  # Ensure consistent structure
+                    }
+                    upload_json = json.dumps(upload_content, ensure_ascii=False, indent=2)
+                    
+                    # Save to local sync file, compress, and upload
+                    with open(self.local_sync_file, 'w', encoding='utf-8') as f:
+                        f.write(upload_json)
+                    
+                    if self.compress_json_file(self.local_sync_file, self.local_sync_file_gz):
+                        self.upload_to_webdav(self.local_sync_file_gz, self.local_upload_file)
                 
                 # Show notification with unique format types
                 unique_extensions = list(set([ext for filename in saved_files for ext in [Path(filename).suffix]]))
                 format_list = ', '.join(unique_extensions[:3])
                 self.show_notification("ClipSon", f"Rich content captured: {format_list}")
-                
-                # Store only the format data for comparison
-                self.last_clipboard_content = json.dumps({"formats": format_data}, ensure_ascii=False, sort_keys=True)
                 
                 return True
                 
@@ -813,106 +737,252 @@ class ClipSon:
         return False
 
     def set_clipboard_multiple_formats(self, format_data):
-        """Set multiple clipboard formats simultaneously using copyq"""
+        """Set multiple clipboard formats simultaneously using copyq or xclip"""
         try:
-            if DEBUG:
-                print(f"DEBUG: Setting {len(format_data)} clipboard formats (multi-mime)")
-            # Build the argument list for copyq: [mime1, value1, mime2, value2, ...]
-            args = ['copyq', 'copy']
-
-            #Use a priority order for consistency
-            set_priority = [
-                'text/plain', 'text/html', 'text/rtf', 'application/rtf', 'application/x-rtf',
-                'text/richtext', 'text/uri-list', 'text/x-moz-url',
-                'UTF8_STRING', 'STRING', 'TEXT'
-            ]
-            
-            used = set()
-            
-            for format_name in set_priority:
-                if format_name in format_data and format_name not in used:
-                    args.append(format_name)
-                    args.append(format_data[format_name])
-                    used.add(format_name)
-            # # Add any remaining formats not in priority list
-            # for format_name in format_data:
-            #     if format_name not in used:
-            #         args.append(format_name)
-            #         args.append(format_data[format_name])
-            #         used.add(format_name)            
-
-            # Check if total argument length would exceed system limits (e.g., 2MB)
-            total_args_length = sum(len(str(arg)) for arg in args)
-            if total_args_length > 2 * 1024 * 1024:  # 2MB limit
-                if DEBUG:
-                    print(f"DEBUG: Total arguments length ({total_args_length} bytes) exceeds 2MB limit, falling back to text/plain only")
-                # Fall back to setting only text/plain format
-                if 'text/plain' in format_data:
-                    return self.set_clipboard_content(format_data['text/plain'])
+            if self.use_copyq:
+                debug_print(f"Setting {len(format_data)} clipboard formats (multi-mime) with copyq")
+                # ...existing copyq logic...
+                args = ['copyq', 'copy']
+                set_priority = [
+                    'text/plain', 'text/html', 'text/rtf', 'application/rtf', 'application/x-rtf',
+                    'text/richtext', 'text/uri-list', 'text/x-moz-url'                    
+                ]
+                used = set()
+                for format_name in set_priority:
+                    if format_name in format_data and format_name not in used:
+                        args.append(format_name)
+                        args.append(format_data[format_name])
+                        used.add(format_name)
+                total_args_length = sum(len(str(arg)) for arg in args)
+                if total_args_length > 2 * 1024 * 1024:
+                    debug_print(f"Total arguments length ({total_args_length} bytes) exceeds 2MB limit, falling back to text/plain only")
+                    if 'text/plain' in format_data:
+                        return self.set_clipboard_content(format_data['text/plain'])
+                    else:
+                        first_format = next(iter(format_data.values()))
+                        return self.set_clipboard_content(first_format)
+                result = subprocess.run(args, check=True)
+                if result.returncode == 0:
+                    debug_print("Successfully set multiple formats with copyq")
+                    return True
                 else:
-                    # Use the first available format
-                    first_format = next(iter(format_data.values()))
-                    return self.set_clipboard_content(first_format)
-                
-            # Call copyq with all formats at once
-            result = subprocess.run(args, check=True)
-            if result.returncode == 0:
-                if DEBUG:
-                    print("DEBUG: Successfully set multiple formats with copyq")
-                return True
+                    debug_print("copyq returned non-zero exit code")
+                    return False
             else:
-                if DEBUG:
-                    print("DEBUG: copyq returned non-zero exit code")
+                # xclip: only supports one format at a time, prefer text/html > text/rtf > text/plain
+                debug_print(f"Setting clipboard formats with xclip (no multi-mime support)")
+                for fmt in ['text/html', 'text/rtf', 'text/plain']:
+                    if fmt in format_data:
+                        return self.set_xclip_format(format_data[fmt], fmt)
+                # fallback: set first available format
+                for fmt, value in format_data.items():
+                    return self.set_xclip_format(value, fmt)
                 return False
         except Exception as e:
             print(f"Error setting multiple clipboard formats: {e}")
             return False
 
-    def set_clipboard_format(self, content, format_type):
-        """Set clipboard content with specific format using copyq or xclip"""
-        try:
-            if self.use_copyq:
-                result = subprocess.run(['copyq', 'copy', format_type, content], check=True)
-                return result.returncode == 0
-            else:
-                result = subprocess.run(['xclip', '-selection', 'clipboard', '-t', format_type], input=content, text=True, check=True)
-                return result.returncode == 0
+    def set_xclip_format(self, content, format_type):
+        """Set clipboard content with specific format using xclip"""
+        try:            
+            debug_print(f"Setting {format_type} format with xclip")
+            debug_print(f"Content excerpt: {content[:120]}{'...' if len(content) > 120 else ''}")
+            
+            result = subprocess.run(['xclip', '-selection', 'clipboard', '-t', format_type], 
+                input=content, text=True, check=True)
+            return result.returncode == 0
         except Exception as e:
             print(f"Error setting clipboard format {format_type}: {e}")
             return False
 
-    def set_clipboard_rich_content(self, content):
-        """Set clipboard content for legacy rich content format"""
+    def set_clipboard_content_unified(self, content):
+        """Set clipboard content from unified JSON format"""
         try:
-            # Check if this is legacy rich content format
-            if content.startswith("RICH_CONTENT_FORMATS:"):
-                lines = content.split('\n', 2)
-                if len(lines) >= 3:
-                    formats_line = lines[0]
-                    actual_content = lines[2]
-                    
-                    # Extract format information
-                    format_str = formats_line.replace("RICH_CONTENT_FORMATS:", "").strip()
-                    available_formats = [fmt.strip() for fmt in format_str.split(",")]
-                    
-                    if DEBUG:
-                        print(f"DEBUG: Setting legacy rich content with formats: {', '.join(available_formats)}")
-                    
-                    # Set content based on available format (prioritize HTML, then RTF, then plain text)
-                    if "HTML" in available_formats:
-                        return self.set_clipboard_format(actual_content, "text/html")
-                    elif "RTF" in available_formats:
-                        return self.set_clipboard_format(actual_content, "text/rtf")
+            debug_print(f"set_clipboard_content_unified received JSON: {content[:120]}{'...' if len(content) > 120 else ''}")
+            # Handle possible BOM (Byte Order Mark) at the start of content
+            if content and ord(content[0]) == 0xFEFF:
+                debug_print("Detected UTF-8 BOM, stripping it before parsing JSON.")
+                content = content.lstrip('\ufeff')
+            try:
+                data = json.loads(content)
+                content_type = data.get("type")
+                debug_print(f"Parsed JSON type: {content_type}, keys: {list(data.keys())}")
+                if content_type == "CLIPBOARD_IMAGE":
+                    image_data = base64.b64decode(data["data"])
+                    debug_print(f"Decoded image data, length: {len(image_data)}")
+                    return self.set_clipboard_image(image_data)
+                elif content_type == "MULTI_FORMAT_CLIPBOARD":
+                    if "formats" in data:
+                        debug_print(f"MULTI_FORMAT_CLIPBOARD formats: {list(data['formats'].keys())}")
+                        # Decode Unicode escape sequences in format data
+                        decoded_formats = {}
+                        for fmt, fmt_content in data["formats"].items():
+                            if isinstance(fmt_content, str):
+                                # Decode Unicode escape sequences (e.g., \u003c -> <, \u0026 -> &)
+                                try:
+                                    decoded_content = fmt_content.encode('utf-8').decode('unicode_escape')
+                                    decoded_formats[fmt] = decoded_content
+                                    debug_print(f"Decoded {fmt}: {len(fmt_content)} -> {len(decoded_content)} chars")
+                                except UnicodeDecodeError:
+                                    # If decoding fails, use original content
+                                    decoded_formats[fmt] = fmt_content
+                                    debug_print(f"Failed to decode {fmt}, using original content")
+                            else:
+                                decoded_formats[fmt] = fmt_content
+                        return self.set_clipboard_multiple_formats(decoded_formats)
+                elif content_type == "PLAIN_TEXT":
+                    if "content" in data:
+                        debug_print(f"PLAIN_TEXT content: {repr(data['content'])}")
+                        # Decode Unicode escape sequences for plain text too
+                        try:
+                            decoded_content = data["content"].encode('utf-8').decode('unicode_escape')
+                            return self.set_clipboard_content(decoded_content)
+                        except UnicodeDecodeError:
+                            return self.set_clipboard_content(data["content"])
                     else:
-                        # Fallback to plain text
-                        return self.set_clipboard_content(actual_content)
-            else:
-                # Regular text content
-                return self.set_clipboard_content(content)
-                
+                        debug_print("PLAIN_TEXT but no content field, setting empty string")
+                        return self.set_clipboard_content("")
+            except Exception as e:
+                print(f"DEBUG: Failed to parse JSON clipboard content: {e}")            
         except Exception as e:
-            print(f"Error setting legacy rich clipboard content: {e}")
+            print(f"Error setting unified clipboard content: {e}")
             return self.set_clipboard_content(content)
+
+    def get_current_clipboard_fingerprint(self):
+        """Get current clipboard content fingerprint for comparison"""
+        try:
+            # Check for clipboard image first (highest priority)
+            has_image = self.has_clipboard_image()
+            if has_image:
+                debug_print(f"Getting IMAGE fingerprint...")
+                result = subprocess.run(['xclip', '-selection', 'clipboard', '-t', 'image/png', '-o'], capture_output=True)
+                if result.returncode == 0 and result.stdout:
+                    current_image_hash = hashlib.md5(result.stdout).hexdigest()
+                    fingerprint = json.dumps({
+                        "type": "CLIPBOARD_IMAGE",
+                        "format": "png",
+                        "size": len(result.stdout),
+                        "hash": current_image_hash
+                    }, ensure_ascii=False, sort_keys=True)
+                    debug_print(f"Image fingerprint: {fingerprint}")
+                    return fingerprint
+            
+            # Check for rich text formats (medium priority)
+            has_rich = self.has_clipboard_rich_text()
+            if has_rich:
+                debug_print(f"Getting RICH TEXT fingerprint...")
+                current_rich_formats = self.get_clipboard_formats()
+                
+                # Build current multi-format data for comparison
+                format_priority = [
+                    ('text/plain', '.txt'), ('text/html', '.html'), ('text/rtf', '.rtf'), 
+                    ('application/rtf', '.app-rtf'), ('application/x-rtf', '.x-rtf'), 
+                    ('text/richtext', '.richtext'), ('text/uri-list', '.uri'), 
+                    ('text/x-moz-url', '.url')
+                ]
+                
+                current_format_data = {}
+                seen_content = set()
+                
+                for format_name, ext in format_priority:
+                    if format_name.strip() in current_rich_formats:
+                        try:
+                            result = subprocess.run(['xclip', '-selection', 'clipboard', '-t', format_name, '-o'], 
+                                                  capture_output=True, text=True, errors='replace')
+                            if result.returncode == 0 and result.stdout.strip():
+                                content = result.stdout.strip()
+                                if content not in seen_content:
+                                    current_format_data[format_name] = content
+                                    seen_content.add(content)
+                        except Exception:
+                            continue
+                
+                if current_format_data:
+                    # Create comparison string using content hashes for dynamic formats
+                    comparison_data = {}
+                    for fmt, content in current_format_data.items():
+                        if fmt in ['text/html', 'text/rtf', 'application/rtf', 'application/x-rtf']:
+                            # Normalize and hash dynamic formats to handle minor variations
+                            if fmt == 'text/html':
+                                # Normalize HTML by removing extra whitespace and line breaks
+                                import re
+                                normalized_content = re.sub(r'\s+', ' ', content.strip())
+                                normalized_content = re.sub(r'>\s+<', '><', normalized_content)
+                                content_hash = hashlib.md5(normalized_content.encode('utf-8')).hexdigest()
+                                debug_print(f"HTML content normalized for hashing: length {len(content)} -> {len(normalized_content)}")
+                            else:
+                                # Use content hash for other dynamic formats
+                                content_hash = hashlib.md5(content.encode('utf-8')).hexdigest()
+                            comparison_data[fmt] = content_hash
+                        elif fmt == 'text/plain':
+                            # Hash text/plain content for consistency with standalone plain text fingerprinting
+                            content_hash = hashlib.md5(content.encode('utf-8')).hexdigest()
+                            comparison_data[fmt] = content_hash
+                        else:
+                            # Use actual content for other stable formats
+                            comparison_data[fmt] = content
+                    
+                    fingerprint = json.dumps({"formats": comparison_data}, ensure_ascii=False, sort_keys=True)                    
+                    
+                    # Additional check: if we have the same plain text as before, don't re-capture
+                    # This prevents duplicate captures when only HTML formatting metadata changes
+                    if 'text/plain' in comparison_data:
+                        current_plain_text = comparison_data['text/plain']
+                        if hasattr(self, 'last_plain_text_content') and current_plain_text == self.last_plain_text_content:
+                            debug_print(f"Plain text content unchanged, using previous fingerprint to prevent duplicate capture")
+                            return self.last_clipboard_content if self.last_clipboard_content else fingerprint
+                        self.last_plain_text_content = current_plain_text
+                    
+                    return fingerprint
+            
+            # Check for plain text (lowest priority)
+            current_content = self.get_clipboard_content()
+            if current_content:
+                # Use hash for plain text content for consistency with other formats
+                content_hash = hashlib.md5(current_content.encode('utf-8')).hexdigest()
+                fingerprint = json.dumps({
+                    "type": "PLAIN_TEXT",
+                    "hash": content_hash
+                }, ensure_ascii=False, sort_keys=True)
+                # debug_print(f"Plain text fingerprint: {fingerprint}")
+                return fingerprint
+            
+            debug_print(f"No clipboard content found")
+            return ""
+            
+        except Exception as e:
+            debug_print(f"Error getting clipboard fingerprint: {e}")
+            return ""
+
+    def check_copyq_daemon(self):
+        """Check if copyq daemon is running and accepting connections"""
+        try:
+            # First check if copyq command exists
+            result = subprocess.run(['which', 'copyq'], capture_output=True, text=True)
+            if result.returncode != 0:
+                debug_print("copyq command not found in PATH")
+                return False
+            
+            # Test actual clipboard functionality - try to get clipboard content
+            # This is a better test than 'copyq info' which doesn't validate daemon functionality
+            result = subprocess.run(['copyq', 'clipboard'], capture_output=True, text=True, timeout=3)
+            if result.returncode == 0:
+                debug_print("copyq daemon clipboard test successful")
+                return True
+            else:
+                debug_print(f"copyq daemon clipboard test failed with return code: {result.returncode}")
+                debug_print(f"copyq stderr: {result.stderr}")
+                return False
+                    
+        except subprocess.TimeoutExpired:
+            debug_print("copyq daemon test timed out after 3 seconds")
+            return False
+        except FileNotFoundError:
+            debug_print("copyq command not found")
+            return False
+        except Exception as e:
+            debug_print(f"copyq daemon test failed: {e}")
+            return False
 
     def run(self):
         """Main run loop"""
@@ -938,6 +1008,7 @@ class ClipSon:
             print(f"  - {peer_file}")
         print(f"Remote check interval: {self.remote_check_interval} seconds")
         print("Supported formats: Multi-format Text, Images (unified JSON), HTML, RTF, URLs")
+        print("Note: First clipboard capture after startup will be saved locally but not synced.")
         
         while True:
             try:
@@ -946,110 +1017,40 @@ class ClipSon:
                 remote_content = self.check_all_remote_files_for_updates()
                 # Note: last_clipboard_content is already updated inside check_all_remote_files_for_updates()
                 
-                # Check for clipboard image first (highest priority)
-                if self.has_clipboard_image():
-                    # Get current image data and check hash
-                    result = subprocess.run(['xclip', '-selection', 'clipboard', '-t', 'image/png', '-o'], capture_output=True)
-                    if result.returncode == 0 and result.stdout:
-                        current_image_hash = hashlib.md5(result.stdout).hexdigest()
-                        
-                        # Create comparison format
-                        current_image_comparison = json.dumps({
-                            "type": "CLIPBOARD_IMAGE",
-                            "format": "png",
-                            "size": len(result.stdout),
-                            "hash": current_image_hash
-                        }, ensure_ascii=False, sort_keys=True)
-                        
-                        if current_image_comparison != self.last_clipboard_content:
-                            self.save_clipboard_image()
-                        elif DEBUG:
-                            print(f"DEBUG: Image unchanged, skipping...")
-                            
-                # Check for rich text formats (medium priority)
-                elif self.has_clipboard_rich_text():
-                    # Get the current rich content and compare with last captured
-                    current_rich_formats = self.get_clipboard_formats()
+                # Debug clipboard detection
+                has_image = self.has_clipboard_image()
+                has_rich = self.has_clipboard_rich_text()
+                debug_print(f"Clipboard detection: image={has_image}, rich_text={has_rich}")
+                
+                # Get current clipboard fingerprint for comparison
+                current_fingerprint = self.get_current_clipboard_fingerprint()
+                debug_print(f"Current fingerprint: {repr(current_fingerprint) if current_fingerprint else 'None'}")
+                debug_print(f"Last fingerprint: {repr(self.last_clipboard_content) if self.last_clipboard_content else 'None'}")
+                debug_print(f"Fingerprints equal: {current_fingerprint == self.last_clipboard_content}")
+                
+                # Only process if fingerprint has changed and we have actual content
+                if current_fingerprint and current_fingerprint != self.last_clipboard_content:
+                    debug_print(f"Clipboard content changed, processing...")
                     
-                    # Build current multi-format data for comparison
-                    # Updated priority order with text/plain first
-                    format_priority = [
-                        ('text/plain', '.txt'), ('text/html', '.html'), ('text/rtf', '.rtf'), 
-                        ('application/rtf', '.app-rtf'), ('application/x-rtf', '.x-rtf'), 
-                        ('text/richtext', '.richtext'), ('text/uri-list', '.uri'), 
-                        ('text/x-moz-url', '.url'), ('UTF8_STRING', '.utf8'), 
-                        ('STRING', '.string'), ('TEXT', '.text')
-                    ]
+                    # Determine which save method to use based on content type
+                    if has_image:
+                        debug_print(f"Saving as IMAGE...")
+                        self.save_clipboard_image()
+                    elif has_rich:
+                        debug_print(f"Saving as RICH TEXT...")
+                        self.save_clipboard_rich_content()
+                    else:
+                        debug_print(f"Saving as PLAIN TEXT...")
+                        current_text = self.get_clipboard_content()
+                        if current_text:
+                            self.save_clipboard_text(current_text)
                     
-                    # Get all available format content
-                    current_format_data = {}
-                    seen_content = set()
-                    
-                    for format_name, ext in format_priority:
-                        if format_name.strip() in current_rich_formats:
-                            try:
-                                result = subprocess.run(['xclip', '-selection', 'clipboard', '-t', format_name, '-o'], 
-                                                      capture_output=True, text=True, errors='replace')
-                                if result.returncode == 0 and result.stdout.strip():
-                                    content = result.stdout.strip()
-                                    if content not in seen_content:
-                                        current_format_data[format_name] = content
-                                        seen_content.add(content)
-                            except Exception:
-                                continue
-                    
-                    if current_format_data:
-                        # Create comparison string using content hashes instead of raw content for dynamic formats
-                        comparison_data = {}
-                        for fmt, content in current_format_data.items():
-                            if fmt in ['text/html', 'text/rtf', 'application/rtf', 'application/x-rtf']:
-                                # For formats that might have dynamic content, use content hash for comparison
-                                # but still store full content for upload
-                                content_hash = hashlib.md5(content.encode('utf-8')).hexdigest()
-                                comparison_data[fmt] = content_hash
-                            else:
-                                # For stable formats, use actual content
-                                comparison_data[fmt] = content
-                        
-                        current_comparison_content = json.dumps({"formats": comparison_data}, ensure_ascii=False, sort_keys=True)
-                        
-                        # Check if we have a previous comparison
-                        has_meaningful_change = True
-                        if self.last_clipboard_content and self.last_clipboard_content.startswith('{"formats"'):
-                            try:
-                                last_comparison_data = json.loads(self.last_clipboard_content)["formats"]
-                                
-                                # Compare stable text formats for meaningful changes
-                                # Now including text/plain as the primary stable format
-                                stable_formats = ['text/plain', 'UTF8_STRING', 'STRING', 'TEXT']
-                                current_stable = {k: v for k, v in comparison_data.items() if k in stable_formats}
-                                last_stable = {k: v for k, v in last_comparison_data.items() if k in stable_formats}
-                                
-                                # If stable content hasn't changed, consider it unchanged
-                                if current_stable == last_stable:
-                                    has_meaningful_change = False
-                                    if DEBUG:
-                                        print(f"DEBUG: Only dynamic content changed (HTML/RTF timestamps), ignoring...")                                
-                                            
-                            except Exception as e:
-                                if DEBUG:
-                                    print(f"DEBUG: Error comparing content: {e}")
-                        
-                        # Only save if there's a meaningful change
-                        if has_meaningful_change:
-                            if DEBUG and not (self.last_clipboard_content and self.last_clipboard_content.startswith('{"formats"')):
-                                print(f"DEBUG: Rich content changed, saving...")
-                            self.save_clipboard_rich_content()
-                            # Store the comparison data for next time
-                            self.last_clipboard_content = current_comparison_content
-                        elif DEBUG:
-                            print(f"DEBUG: Rich content unchanged (ignoring dynamic changes), skipping...")
+                    # Update the last known fingerprint
+                    self.last_clipboard_content = current_fingerprint
+                elif current_fingerprint:
+                    debug_print(f"Clipboard content unchanged, skipping...")
                 else:
-                    # Check clipboard text content (lowest priority)
-                    current_content = self.get_clipboard_content()
-                    if current_content and current_content != self.last_clipboard_content:
-                        self.save_clipboard_text(current_content)
-                        self.last_clipboard_content = current_content
+                    debug_print(f"No clipboard content detected.")
                 
                 # Wait before next check
                 time.sleep(0.5)

@@ -18,13 +18,6 @@ function Get-Configuration {
     }
 }
 
-function Write-DebugMsg {
-    param([string]$Message)
-    if ($global:Config.app.debug_enabled) {
-        Write-Host "$(Get-Date -Format 'HH:mm:ss') - DEBUG: $Message"
-    }
-}
-
 function Get-PasswordIfNeeded {
     param($NextcloudConfig)
     if ([string]::IsNullOrWhiteSpace($NextcloudConfig.Password)) {

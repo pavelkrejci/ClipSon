@@ -12,10 +12,10 @@ function global:Write-DebugMsg {
     param([string]$Message)
     # Safe default if Config isn't loaded yet
     if ($global:Config -and $global:Config.app.debug_enabled) {
-        Write-Host "$(Get-Date -Format 'HH:mm:ss') - DEBUG: $Message"
+        Write-Host "$(Get-Date -Format 'HH:mm:ss.fff') - DEBUG: $Message"
     }
     elseif ($global:EnableDebugMessages) {
-        Write-Host "$(Get-Date -Format 'HH:mm:ss') - DEBUG: $Message"
+        Write-Host "$(Get-Date -Format 'HH:mm:ss.fff') - DEBUG: $Message"
     }
 }
 
@@ -42,7 +42,7 @@ $global:skipClipboardCheckUntil = [DateTime]::MinValue
 $global:exitLoop = $false
 
 # Output directory - make it global so it's accessible in event handlers
-$global:outputDir = ".\clipboard-captures"
+$global:outputDir = ".\captures-$($env:COMPUTERNAME)"
 $global:maxEntries = 100  # Add maximum entries configuration
 
 if (!(Test-Path $global:outputDir)) {
@@ -92,7 +92,7 @@ $handler = {
             return
         }
         
-        Write-DebugMsg "Clipboard content changed at $(Get-Date -Format 'HH:mm:ss')"
+        Write-DebugMsg "Clipboard content changed at $(Get-Date -Format 'HH:mm:ss.fff')"
         
         # Check if clipboard has image content first (highest priority)
         if ([System.Windows.Forms.Clipboard]::ContainsImage()) {
@@ -115,7 +115,7 @@ $handler = {
                 
                 # Save the image bytes to file
                 [System.IO.File]::WriteAllBytes($filename, $imageBytes)
-                Write-Host "$(Get-Date -Format 'HH:mm:ss') - Image saved: $filename"
+                Write-Host "$(Get-Date -Format 'HH:mm:ss.fff') - Image saved: $filename"
                 
                 # Create unified JSON format for image
                 $imageB64 = [System.Convert]::ToBase64String($imageBytes)
@@ -152,15 +152,16 @@ $handler = {
                 catch { }
             }
             
-            if ($currentFormats -contains "RTF") {
-                try {
-                    $rtfContent = [System.Windows.Forms.Clipboard]::GetText([System.Windows.Forms.TextDataFormat]::Rtf)
-                    if ($rtfContent) {
-                        $currentFormatData["text/rtf"] = $rtfContent
-                    }
-                }
-                catch { }
-            }
+            # TODO: text/rtf support - currently commented out due to issues with RTF handling in Linux
+            # if ($currentFormats -contains "RTF") {
+            #     try {
+            #         $rtfContent = [System.Windows.Forms.Clipboard]::GetText([System.Windows.Forms.TextDataFormat]::Rtf)
+            #         if ($rtfContent) {
+            #             $currentFormatData["text/rtf"] = $rtfContent
+            #         }
+            #     }
+            #     catch { }
+            # }
             
             if ($currentFormats -contains "Text" -or $currentFormats -contains "Unicode") {
                 try {
@@ -190,7 +191,7 @@ $handler = {
                 
                 # Verify the filename is correct before writing
                 if ($filename -notmatch "clipboard_text_\d{3}\.txt$") {
-                    Write-Error "$(Get-Date -Format 'HH:mm:ss') - ERROR: Invalid filename generated: '$filename'"
+                    Write-Error "$(Get-Date -Format 'HH:mm:ss.fff') - ERROR: Invalid filename generated: '$filename'"
                     return
                 }
                 
@@ -199,17 +200,17 @@ $handler = {
                 # Save to numbered file
                 try {
                     [System.IO.File]::WriteAllText($filename, $currentContent, [System.Text.Encoding]::UTF8)
-                    Write-Host "$(Get-Date -Format 'HH:mm:ss') - Text saved: $filename"
+                    Write-Host "$(Get-Date -Format 'HH:mm:ss.fff') - Text saved: $filename"
                     
                     # Verify file was created correctly
                     if (Test-Path $filename) {
                         $fileSize = (Get-Item $filename).Length
                         Write-DebugMsg "File created successfully, size: $fileSize bytes"
                     } else {
-                        Write-Error "$(Get-Date -Format 'HH:mm:ss') - ERROR: File was not created: '$filename'"
+                        Write-Error "$(Get-Date -Format 'HH:mm:ss.fff') - ERROR: File was not created: '$filename'"
                     }
                 } catch {
-                    Write-Error "$(Get-Date -Format 'HH:mm:ss') - ERROR: Failed to write file '$filename': $($_.Exception.Message)"
+                    Write-Error "$(Get-Date -Format 'HH:mm:ss.fff') - ERROR: Failed to write file '$filename': $($_.Exception.Message)"
                     return
                 }
                 
@@ -232,7 +233,7 @@ $handler = {
     catch {
         Write-host "Error accessing clipboard: $($_.Exception.Message)" -ForegroundColor Red
         if ($global:EnableDebugMessages) {
-            Write-Host "$(Get-Date -Format 'HH:mm:ss') - DEBUG: Exception details: $($_.Exception | Out-String)"
+            Write-Host "$(Get-Date -Format 'HH:mm:ss.fff') - DEBUG: Exception details: $($_.Exception | Out-String)"
         }
     }
 }
