@@ -14,6 +14,7 @@
     "app": {
         "max_history": 200,
         "remote_check_interval_seconds": 1,
-        "debug_enabled": false
+        "debug_enabled": false,
+		"use_copyq": true
     }
 }
