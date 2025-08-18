@@ -10,6 +10,7 @@ Nextcloud clipboard synchronization tool for Linux (Python) and Windows (PowerSh
 - **Cross-platform clipboard monitoring** - Works on both Windows and Linux
 - **Real-time synchronization** - Automatically monitors clipboard changes
 - **Text and image support** - Handles both text content and images
+- **File copy support** - Copy files between devices via clipboard (Linux with file manager integration)
 - **Multi-MIME clipboard support** - Supports rich text formats (HTML, RTF) with copyq on Linux
 - **Duplicate prevention** - Avoids saving identical clipboard content
 - **Multi-device synchronization** - All instances must use the same Nextcloud account to see each other's updates
@@ -49,9 +50,11 @@ Nextcloud clipboard synchronization tool for Linux (Python) and Windows (PowerSh
    ```bash
    python clipson.py
    ```
-4. Copy any text or image to clipboard
+4. Copy any text, image, or file to clipboard
 5. Content will be automatically saved and synced to Nextcloud
 6. Peers' clipboard syncs are regularly checked (parameter `remote_check_interval_seconds`), retrieved and pushed to local system clipboard
+
+**File Copy Support:** ClipSon can detect when files are copied to clipboard (e.g., using Ctrl+C in a file manager) and automatically sync the file content across devices. Files are restored to a temporary directory on the receiving device and added to clipboard as file URIs.
 
 **Note:** If copyq is installed and running as a daemon, ClipSon will automatically use it for enhanced multi-MIME clipboard support. If copyq is not available or not running, ClipSon will fall back to xclip.
 
@@ -75,7 +78,8 @@ Nextcloud clipboard synchronization tool for Linux (Python) and Windows (PowerSh
         "max_history": 200, // Maximum number of clipboard entries in local cache (directory clipboard-captures)
         "remote_check_interval_seconds": 1, // Interval to check for remote changes
         "debug_enabled": false, // Enable debug logging
-        "use_copyq": true // Use copyq for enhanced multi-MIME support on Linux (requires copyq daemon running)
+        "use_copyq": true, // Use copyq for enhanced multi-MIME support on Linux (requires copyq daemon running)
+        "max_file_copy_size_mb": 50 // Maximum file size for file copy feature (in MB)
     }
 ```
 
