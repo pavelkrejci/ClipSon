@@ -21,6 +21,9 @@ import getpass
 import gzip
 import base64
 import hashlib
+import re
+import urllib.parse
+import mimetypes
 
 def load_configuration():
     """Load configuration from JSON file"""
@@ -173,6 +176,151 @@ class ClipSon:
         except Exception:
             pass
         return False
+
+    def has_clipboard_file_uris(self):
+        """Check if clipboard contains file URIs (text/uri-list)"""
+        try:
+            formats = self.get_clipboard_formats()
+            return 'text/uri-list' in [fmt.strip() for fmt in formats]
+        except Exception:
+            pass
+        return False
+
+    def get_clipboard_file_uris(self):
+        """Get file URIs from clipboard"""
+        try:
+            if self.use_copyq:
+                result = subprocess.run(['copyq', 'clipboard', 'text/uri-list'], capture_output=True, text=True)
+            else:
+                result = subprocess.run(['xclip', '-selection', 'clipboard', '-t', 'text/uri-list', '-o'], 
+                                      capture_output=True, text=True)
+            
+            if result.returncode == 0 and result.stdout.strip():
+                # Parse URI list - each URI on a separate line
+                uri_list = []
+                for line in result.stdout.strip().split('\n'):
+                    line = line.strip()
+                    if line and line.startswith('file://'):
+                        # Decode URI to get actual file path
+                        file_path = urllib.parse.unquote(line[7:])  # Remove 'file://' prefix
+                        uri_list.append(file_path)
+                return uri_list
+        except Exception as e:
+            debug_print(f"Error getting file URIs from clipboard: {e}")
+        return []
+
+    def save_clipboard_files(self):
+        """Save clipboard files to Nextcloud and local storage"""
+        try:
+            file_uris = self.get_clipboard_file_uris()
+            if not file_uris:
+                return False
+
+            file_number = self.get_next_file_number()
+            files_data = {}
+            saved_files = []
+
+            for file_path in file_uris:
+                try:
+                    # Check if file exists and is readable
+                    if not os.path.exists(file_path):
+                        debug_print(f"File not found: {file_path}")
+                        continue
+                    
+                    if not os.path.isfile(file_path):
+                        debug_print(f"Not a regular file: {file_path}")
+                        continue
+
+                    # Get file info
+                    file_stat = os.stat(file_path)
+                    file_size = file_stat.st_size
+                    
+                    # Limit file size to prevent excessive memory usage (default 50MB)
+                    max_file_size = CONFIG_DATA['app'].get('max_file_copy_size_mb', 50) * 1024 * 1024
+                    if file_size > max_file_size:
+                        print(f"File too large to copy: {file_path} ({file_size / 1024 / 1024:.1f} MB > {max_file_size / 1024 / 1024:.1f} MB)")
+                        continue
+
+                    # Read file content
+                    with open(file_path, 'rb') as f:
+                        file_content = f.read()
+                    
+                    # Encode file content as base64
+                    file_b64 = base64.b64encode(file_content).decode('utf-8')
+                    
+                    # Get file name and extension
+                    file_name = os.path.basename(file_path)
+                    
+                    # Store file data
+                    files_data[file_name] = {
+                        "original_path": file_path,
+                        "content": file_b64,
+                        "size": file_size,
+                        "mime_type": self.get_mime_type(file_path)
+                    }
+                    
+                    # Save file locally for reference
+                    local_file = self.output_dir / f"clipboard_file_{file_number:03d}_{file_name}"
+                    with open(local_file, 'wb') as f:
+                        f.write(file_content)
+                    saved_files.append(local_file)
+                    
+                    debug_print(f"Processed file: {file_name} ({file_size} bytes)")
+                    
+                except Exception as e:
+                    debug_print(f"Error processing file {file_path}: {e}")
+                    continue
+
+            if files_data:
+                print(f"{datetime.now().strftime('%H:%M:%S')} - File(s) saved: {len(files_data)} file(s)")
+                for filename in files_data.keys():
+                    print(f"  - {filename}")
+                
+                # Skip sync on first clipboard capture after app start
+                if self.first_clipboard_capture:
+                    self.first_clipboard_capture = False
+                    print(f"{datetime.now().strftime('%H:%M:%S')} - Skipping sync for first clipboard capture")
+                else:
+                    # Create file upload content
+                    upload_content = {
+                        "type": "CLIPBOARD_FILES",
+                        "files": files_data
+                    }
+                    upload_json = json.dumps(upload_content, ensure_ascii=False, indent=2)
+                    
+                    # Save to local sync file, compress, and upload
+                    with open(self.local_sync_file, 'w', encoding='utf-8') as f:
+                        f.write(upload_json)
+                    
+                    if self.compress_json_file(self.local_sync_file, self.local_sync_file_gz):
+                        if self.upload_to_webdav(self.local_sync_file_gz, self.local_upload_file):
+                            print(f"{datetime.now().strftime('%H:%M:%S')} - Uploaded compressed files to WebDAV: {self.local_upload_file}")
+                
+                # Show notification
+                file_names = list(files_data.keys())[:3]
+                file_list = ', '.join(file_names)
+                if len(files_data) > 3:
+                    file_list += f" (+{len(files_data) - 3} more)"
+                self.show_notification("ClipSon", f"Files captured: {file_list}")
+                
+                return True
+                
+        except Exception as e:
+            print(f"Error saving clipboard files: {e}")
+        return False
+
+    def get_mime_type(self, file_path):
+        """Get MIME type for a file"""
+        try:
+            # Use python's mimetypes module
+            mime_type, _ = mimetypes.guess_type(file_path)
+            if mime_type:
+                return mime_type
+        except:
+            pass
+        
+        # Fallback to application/octet-stream
+        return "application/octet-stream"
 
     def compress_json_file(self, json_file, gz_file):
         """Compress JSON file to .gz format"""
@@ -638,7 +786,20 @@ class ClipSon:
                 'text/x-moz-url', 'text/uri-list',
                 'application/x-color'
             ]
-            return any(fmt.strip() in rich_text_formats for fmt in formats)
+            
+            # Check if any rich text formats are present
+            has_rich = any(fmt.strip() in rich_text_formats for fmt in formats)
+            
+            # If text/uri-list is present, check if it contains actual file URIs
+            # If it does, don't consider this as rich text
+            if has_rich and 'text/uri-list' in [fmt.strip() for fmt in formats]:
+                file_uris = self.get_clipboard_file_uris()
+                if file_uris:  # If we have actual file URIs, this is file content, not rich text
+                    # Check if we have other rich text formats besides text/uri-list
+                    other_rich_formats = [f for f in rich_text_formats if f != 'text/uri-list']
+                    return any(fmt.strip() in other_rich_formats for fmt in formats)
+            
+            return has_rich
         except Exception:
             pass
         return False
@@ -795,6 +956,80 @@ class ClipSon:
             print(f"Error setting clipboard format {format_type}: {e}")
             return False
 
+    def set_clipboard_files(self, files_data):
+        """Set clipboard with file URIs and restore files to temp location"""
+        try:
+            # Create temporary directory for restored files
+            temp_dir = Path(f'./temp-restored-files-{self.hostname}')
+            temp_dir.mkdir(exist_ok=True)
+            
+            restored_files = []
+            uri_list = []
+            
+            for filename, file_info in files_data.items():
+                try:
+                    # Decode file content from base64
+                    file_content = base64.b64decode(file_info["content"])
+                    
+                    # Create safe filename
+                    safe_filename = self.sanitize_filename(filename)
+                    temp_file_path = temp_dir / safe_filename
+                    
+                    # Write file to temp location
+                    with open(temp_file_path, 'wb') as f:
+                        f.write(file_content)
+                    
+                    # Add to URI list
+                    file_uri = f"file://{temp_file_path.absolute()}"
+                    uri_list.append(file_uri)
+                    restored_files.append(temp_file_path)
+                    
+                    debug_print(f"Restored file: {safe_filename} ({len(file_content)} bytes) to {temp_file_path}")
+                    
+                except Exception as e:
+                    debug_print(f"Error restoring file {filename}: {e}")
+                    continue
+            
+            if uri_list:
+                # Set clipboard with file URI list
+                uri_content = '\n'.join(uri_list)
+                
+                if self.use_copyq:
+                    # Set both text/uri-list and text/plain for better compatibility
+                    args = ['copyq', 'copy', 'text/uri-list', uri_content, 'text/plain', uri_content]
+                    result = subprocess.run(args, check=True)
+                    success = result.returncode == 0
+                else:
+                    # Use xclip to set text/uri-list
+                    success = self.set_xclip_format(uri_content, 'text/uri-list')
+                
+                if success:
+                    print(f"Restored {len(restored_files)} file(s) to clipboard:")
+                    for file_path in restored_files:
+                        print(f"  - {file_path}")
+                    return True
+                else:
+                    debug_print("Failed to set clipboard with file URIs")
+                    return False
+            
+            return False
+            
+        except Exception as e:
+            print(f"Error setting clipboard files: {e}")
+            return False
+
+    def sanitize_filename(self, filename):
+        """Sanitize filename for safe file system usage"""
+        # Remove or replace problematic characters
+        safe_chars = '-_.() abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+        safe_filename = ''.join(c if c in safe_chars else '_' for c in filename)
+        
+        # Ensure it's not empty and doesn't start with dot
+        if not safe_filename or safe_filename.startswith('.'):
+            safe_filename = 'restored_file_' + safe_filename
+        
+        return safe_filename[:255]  # Limit length
+
     def set_clipboard_content_unified(self, content):
         """Set clipboard content from unified JSON format"""
         try:
@@ -842,6 +1077,13 @@ class ClipSon:
                     else:
                         debug_print("PLAIN_TEXT but no content field, setting empty string")
                         return self.set_clipboard_content("")
+                elif content_type == "CLIPBOARD_FILES":
+                    if "files" in data:
+                        debug_print(f"CLIPBOARD_FILES: {list(data['files'].keys())}")
+                        return self.set_clipboard_files(data["files"])
+                    else:
+                        debug_print("CLIPBOARD_FILES but no files field")
+                        return False
             except Exception as e:
                 print(f"DEBUG: Failed to parse JSON clipboard content: {e}")            
         except Exception as e:
@@ -865,6 +1107,32 @@ class ClipSon:
                         "hash": current_image_hash
                     }, ensure_ascii=False, sort_keys=True)
                     debug_print(f"Image fingerprint: {fingerprint}")
+                    return fingerprint
+            
+            # Check for file URIs (high priority, after images)
+            has_files = self.has_clipboard_file_uris()
+            if has_files:
+                debug_print(f"Getting FILE URIs fingerprint...")
+                file_uris = self.get_clipboard_file_uris()
+                if file_uris:
+                    # Create fingerprint based on file paths and their modification times
+                    files_info = {}
+                    for file_path in file_uris:
+                        try:
+                            if os.path.exists(file_path) and os.path.isfile(file_path):
+                                stat = os.stat(file_path)
+                                files_info[file_path] = {
+                                    "size": stat.st_size,
+                                    "mtime": stat.st_mtime
+                                }
+                        except:
+                            files_info[file_path] = {"error": "inaccessible"}
+                    
+                    fingerprint = json.dumps({
+                        "type": "CLIPBOARD_FILES", 
+                        "files": files_info
+                    }, ensure_ascii=False, sort_keys=True)
+                    debug_print(f"File URIs fingerprint: {fingerprint}")
                     return fingerprint
             
             # Check for rich text formats (medium priority)
@@ -1007,7 +1275,7 @@ class ClipSon:
         for peer_file in peer_files:
             print(f"  - {peer_file}")
         print(f"Remote check interval: {self.remote_check_interval} seconds")
-        print("Supported formats: Multi-format Text, Images (unified JSON), HTML, RTF, URLs")
+        print("Supported formats: Multi-format Text, Images (unified JSON), HTML, RTF, URLs, Files")
         print("Note: First clipboard capture after startup will be saved locally but not synced.")
         
         while True:
@@ -1019,8 +1287,9 @@ class ClipSon:
                 
                 # Debug clipboard detection
                 has_image = self.has_clipboard_image()
+                has_files = self.has_clipboard_file_uris()
                 has_rich = self.has_clipboard_rich_text()
-                debug_print(f"Clipboard detection: image={has_image}, rich_text={has_rich}")
+                debug_print(f"Clipboard detection: image={has_image}, files={has_files}, rich_text={has_rich}")
                 
                 # Get current clipboard fingerprint for comparison
                 current_fingerprint = self.get_current_clipboard_fingerprint()
@@ -1036,6 +1305,9 @@ class ClipSon:
                     if has_image:
                         debug_print(f"Saving as IMAGE...")
                         self.save_clipboard_image()
+                    elif has_files:
+                        debug_print(f"Saving as FILES...")
+                        self.save_clipboard_files()
                     elif has_rich:
                         debug_print(f"Saving as RICH TEXT...")
                         self.save_clipboard_rich_content()
