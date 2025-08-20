@@ -736,7 +736,8 @@ class ClipSon:
         """Set clipboard content using copyq or xclip"""
         try:
             if self.use_copyq:
-                result = subprocess.run(['copyq', 'copy', 'text/plain', content], check=True)
+                # Use -- to prevent copyq from expanding escape sequences like \n, \t, \\
+                result = subprocess.run(['copyq', 'copy', '--', content], check=True)
                 return result.returncode == 0
             else:
                 result = subprocess.run(['xclip', '-selection', 'clipboard'], input=content, text=True, check=True)
@@ -903,7 +904,7 @@ class ClipSon:
             if self.use_copyq:
                 debug_print(f"Setting {len(format_data)} clipboard formats (multi-mime) with copyq")
                 # ...existing copyq logic...
-                args = ['copyq', 'copy']
+                args = ['copyq', 'copy', '--']  # Add -- to prevent escape sequence expansion
                 set_priority = [
                     'text/plain', 'text/html', 'text/rtf', 'application/rtf', 'application/x-rtf',
                     'text/richtext', 'text/uri-list', 'text/x-moz-url'                    
@@ -996,7 +997,8 @@ class ClipSon:
                 
                 if self.use_copyq:
                     # Set both text/uri-list and text/plain for better compatibility
-                    args = ['copyq', 'copy', 'text/uri-list', uri_content, 'text/plain', uri_content]
+                    # Use -- to prevent escape sequence expansion in file paths
+                    args = ['copyq', 'copy', '--', 'text/uri-list', uri_content, 'text/plain', uri_content]
                     result = subprocess.run(args, check=True)
                     success = result.returncode == 0
                 else:
