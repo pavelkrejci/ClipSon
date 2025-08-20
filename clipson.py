@@ -1049,31 +1049,13 @@ class ClipSon:
                 elif content_type == "MULTI_FORMAT_CLIPBOARD":
                     if "formats" in data:
                         debug_print(f"MULTI_FORMAT_CLIPBOARD formats: {list(data['formats'].keys())}")
-                        # Decode Unicode escape sequences in format data
-                        decoded_formats = {}
-                        for fmt, fmt_content in data["formats"].items():
-                            if isinstance(fmt_content, str):
-                                # Decode Unicode escape sequences (e.g., \u003c -> <, \u0026 -> &)
-                                try:
-                                    decoded_content = fmt_content.encode('utf-8').decode('unicode_escape')
-                                    decoded_formats[fmt] = decoded_content
-                                    debug_print(f"Decoded {fmt}: {len(fmt_content)} -> {len(decoded_content)} chars")
-                                except UnicodeDecodeError:
-                                    # If decoding fails, use original content
-                                    decoded_formats[fmt] = fmt_content
-                                    debug_print(f"Failed to decode {fmt}, using original content")
-                            else:
-                                decoded_formats[fmt] = fmt_content
-                        return self.set_clipboard_multiple_formats(decoded_formats)
+                        # Use format data directly - JSON parsing already handles Unicode escaping
+                        return self.set_clipboard_multiple_formats(data["formats"])
                 elif content_type == "PLAIN_TEXT":
                     if "content" in data:
                         debug_print(f"PLAIN_TEXT content: {repr(data['content'])}")
-                        # Decode Unicode escape sequences for plain text too
-                        try:
-                            decoded_content = data["content"].encode('utf-8').decode('unicode_escape')
-                            return self.set_clipboard_content(decoded_content)
-                        except UnicodeDecodeError:
-                            return self.set_clipboard_content(data["content"])
+                        # Use content directly - JSON parsing already handles Unicode escaping
+                        return self.set_clipboard_content(data["content"])
                     else:
                         debug_print("PLAIN_TEXT but no content field, setting empty string")
                         return self.set_clipboard_content("")

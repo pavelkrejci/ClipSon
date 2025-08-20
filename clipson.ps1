@@ -136,6 +136,15 @@ $handler = {
                 $image.Dispose()
             }
         }
+        # Check if clipboard has files (high priority, after images)
+        elseif (Test-ClipboardFiles) {
+            Write-DebugMsg "Processing clipboard files"
+            
+            $result = Save-ClipboardFiles
+            if ($result) {
+                Write-DebugMsg "Files saved and uploaded successfully"
+            }
+        }
         # Check if clipboard has rich text formats (medium priority)
         elseif (Test-ClipboardRichText) {
             $currentFormats = Get-ClipboardFormats

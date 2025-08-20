@@ -93,10 +93,53 @@ function global:Test-ClipboardRichText {
     try {
         $formats = Get-ClipboardFormats
         $richTextFormats = @("HTML", "RTF", "Files")
-        return ($formats | Where-Object { $_ -in $richTextFormats }).Count -gt 0
+        
+        # Check if we have rich text formats
+        $hasRichFormats = ($formats | Where-Object { $_ -in $richTextFormats }).Count -gt 0
+        
+        # If "Files" format is present, check if it contains actual file paths
+        # If it does, don't consider this as rich text (it should be handled as file copy)
+        if ($hasRichFormats -and "Files" -in $formats) {
+            $fileList = Test-ClipboardFiles
+            if ($fileList -and $fileList.Count -gt 0) {
+                # Check if we have other rich text formats besides "Files"
+                $otherRichFormats = @("HTML", "RTF")
+                return ($formats | Where-Object { $_ -in $otherRichFormats }).Count -gt 0
+            }
+        }
+        
+        return $hasRichFormats
     }
     catch {
         return $false
+    }
+}
+
+function global:Test-ClipboardFiles {
+    try {
+        $formats = Get-ClipboardFormats
+        return "Files" -in $formats
+    }
+    catch {
+        return $false
+    }
+}
+
+function global:Get-ClipboardFiles {
+    try {
+        if ([System.Windows.Forms.Clipboard]::ContainsFileDropList()) {
+            $fileList = [System.Windows.Forms.Clipboard]::GetFileDropList()
+            $files = @()
+            foreach ($file in $fileList) {
+                $files += $file
+            }
+            return $files
+        }
+        return @()
+    }
+    catch {
+        Write-DebugMsg "Error getting clipboard files: $($_.Exception.Message)"
+        return @()
     }
 }
 
@@ -129,6 +172,159 @@ function global:Show-ClipboardNotification {
     }
 }
 
+function global:Save-ClipboardFiles {
+    try {
+        $fileList = Get-ClipboardFiles
+        if (-not $fileList -or $fileList.Count -eq 0) {
+            return $false
+        }
+        
+        Write-DebugMsg "Processing $($fileList.Count) clipboard files"
+        
+        $fileNumber = Get-NextFileNumber
+        $filesData = @{}
+        $savedFiles = @()
+        $maxFileSize = $global:Config.app.max_file_copy_size_mb * 1024 * 1024
+        
+        foreach ($filePath in $fileList) {
+            try {
+                # Check if file exists and is accessible
+                if (-not (Test-Path $filePath)) {
+                    Write-DebugMsg "File not found: $filePath"
+                    continue
+                }
+                
+                $fileInfo = Get-Item $filePath
+                if ($fileInfo.PSIsContainer) {
+                    Write-DebugMsg "Skipping directory: $filePath"
+                    continue
+                }
+                
+                # Check file size limit
+                if ($fileInfo.Length -gt $maxFileSize) {
+                    $sizeMB = [math]::Round($fileInfo.Length / 1024 / 1024, 1)
+                    $maxSizeMB = $global:Config.app.max_file_copy_size_mb
+                    Write-Host "File too large to copy: $filePath ($sizeMB MB > $maxSizeMB MB)" -ForegroundColor Yellow
+                    continue
+                }
+                
+                # Read file content
+                $fileBytes = [System.IO.File]::ReadAllBytes($filePath)
+                $fileB64 = [System.Convert]::ToBase64String($fileBytes)
+                
+                # Get file name and MIME type
+                $fileName = $fileInfo.Name
+                $mimeType = Get-MimeType -FilePath $filePath
+                
+                # Store file data
+                $filesData[$fileName] = @{
+                    original_path = $filePath
+                    content = $fileB64
+                    size = $fileInfo.Length
+                    mime_type = $mimeType
+                }
+                
+                # Save file locally for reference
+                $paddedNumber = $fileNumber.ToString().PadLeft(3, '0')
+                $localFile = Join-Path $global:outputDir "clipboard_file_${paddedNumber}_$fileName"
+                Copy-Item $filePath $localFile
+                $savedFiles += $localFile
+                
+                Write-DebugMsg "Processed file: $fileName ($($fileInfo.Length) bytes)"
+            }
+            catch {
+                Write-DebugMsg "Error processing file $filePath`: $($_.Exception.Message)"
+                continue
+            }
+        }
+        
+        if ($filesData.Count -gt 0) {
+            Write-Host "$(Get-Date -Format 'HH:mm:ss.fff') - File(s) saved: $($filesData.Count) file(s)"
+            foreach ($fileName in $filesData.Keys) {
+                Write-Host "  - $fileName"
+            }
+            
+            # Create file upload content
+            $uploadContent = @{
+                type = "CLIPBOARD_FILES"
+                files = $filesData
+            }
+            $uploadJson = ConvertTo-Json $uploadContent -Depth 10
+            
+            # Upload to WebDAV
+            Upload-ToWebDAV -Content $uploadJson -Connection $global:webdavConnection -LocalSyncFile $global:localSyncFile -LocalSyncFileGz $global:localSyncFileGz -RemoteFilePath $global:localUploadPath
+            
+            # Show notification
+            $fileNames = $filesData.Keys | Select-Object -First 3
+            $fileList = $fileNames -join ', '
+            if ($filesData.Count -gt 3) {
+                $fileList += " (+$($filesData.Count - 3) more)"
+            }
+            Show-ClipboardNotification -Title "ClipSon" -Message "Files captured: $fileList"
+            
+            return $true
+        }
+        
+        return $false
+    }
+    catch {
+        Write-Host "Error saving clipboard files: $($_.Exception.Message)" -ForegroundColor Red
+        return $false
+    }
+}
+
+function Get-MimeType {
+    param([string]$FilePath)
+    
+    try {
+        $extension = [System.IO.Path]::GetExtension($FilePath).ToLower()
+        
+        # Common MIME types
+        $mimeTypes = @{
+            '.txt' = 'text/plain'
+            '.html' = 'text/html'
+            '.htm' = 'text/html'
+            '.css' = 'text/css'
+            '.js' = 'text/javascript'
+            '.json' = 'application/json'
+            '.xml' = 'text/xml'
+            '.pdf' = 'application/pdf'
+            '.doc' = 'application/msword'
+            '.docx' = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+            '.xls' = 'application/vnd.ms-excel'
+            '.xlsx' = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            '.ppt' = 'application/vnd.ms-powerpoint'
+            '.pptx' = 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+            '.jpg' = 'image/jpeg'
+            '.jpeg' = 'image/jpeg'
+            '.png' = 'image/png'
+            '.gif' = 'image/gif'
+            '.bmp' = 'image/bmp'
+            '.tiff' = 'image/tiff'
+            '.ico' = 'image/x-icon'
+            '.svg' = 'image/svg+xml'
+            '.mp3' = 'audio/mpeg'
+            '.wav' = 'audio/wav'
+            '.mp4' = 'video/mp4'
+            '.avi' = 'video/x-msvideo'
+            '.zip' = 'application/zip'
+            '.rar' = 'application/x-rar-compressed'
+            '.7z' = 'application/x-7z-compressed'
+            '.exe' = 'application/x-msdownload'
+            '.msi' = 'application/x-msi'
+        }
+        
+        if ($mimeTypes.ContainsKey($extension)) {
+            return $mimeTypes[$extension]
+        }
+        
+        return 'application/octet-stream'
+    }
+    catch {
+        return 'application/octet-stream'
+    }
+}
+
 function global:Set-ClipboardContentUnified {
     param([string]$Content)
     
@@ -155,6 +351,12 @@ function global:Set-ClipboardContentUnified {
                     if ($data.content) {
                         [System.Windows.Forms.Clipboard]::SetText($data.content)
                         return $true
+                    }
+                }
+                elseif ($contentType -eq "CLIPBOARD_FILES") {
+                    # Handle file content
+                    if ($data.files) {
+                        return Set-ClipboardFiles -FilesData $data.files
                     }
                 }
             }
@@ -191,6 +393,94 @@ function Set-ClipboardImage {
         Write-Warning "Error setting clipboard image: $($_.Exception.Message)"
         return $false
     }
+}
+
+function Set-ClipboardFiles {
+    param([PSObject]$FilesData)
+    
+    try {
+        # Create temporary directory for restored files
+        $tempDir = ".\temp-restored-files-$($env:COMPUTERNAME)"
+        if (!(Test-Path $tempDir)) {
+            New-Item -ItemType Directory -Path $tempDir | Out-Null
+        }
+        
+        $restoredFiles = @()
+        
+        foreach ($fileName in $FilesData.PSObject.Properties.Name) {
+            $fileInfo = $FilesData.$fileName
+            
+            try {
+                # Decode file content from base64
+                $fileBytes = [System.Convert]::FromBase64String($fileInfo.content)
+                
+                # Create safe filename
+                $safeFileName = Get-SafeFileName -FileName $fileName
+                $tempFilePath = Join-Path $tempDir $safeFileName
+                
+                # Write file to temp location
+                [System.IO.File]::WriteAllBytes($tempFilePath, $fileBytes)
+                
+                $restoredFiles += $tempFilePath
+                Write-DebugMsg "Restored file: $safeFileName ($($fileBytes.Length) bytes) to $tempFilePath"
+            }
+            catch {
+                Write-DebugMsg "Error restoring file $fileName`: $($_.Exception.Message)"
+                continue
+            }
+        }
+        
+        if ($restoredFiles.Count -gt 0) {
+            # Set clipboard with file list
+            $fileCollection = New-Object System.Collections.Specialized.StringCollection
+            foreach ($file in $restoredFiles) {
+                $fileCollection.Add($file)
+            }
+            
+            [System.Windows.Forms.Clipboard]::SetFileDropList($fileCollection)
+            
+            Write-Host "Restored $($restoredFiles.Count) file(s) to clipboard:"
+            foreach ($filePath in $restoredFiles) {
+                Write-Host "  - $filePath"
+            }
+            
+            return $true
+        }
+        
+        return $false
+    }
+    catch {
+        Write-Warning "Error setting clipboard files: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Get-SafeFileName {
+    param([string]$FileName)
+    
+    # Remove or replace problematic characters
+    $safeChars = '-_.() abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+    $safeFileName = ''
+    
+    foreach ($char in $FileName.ToCharArray()) {
+        if ($safeChars.Contains($char)) {
+            $safeFileName += $char
+        } else {
+            $safeFileName += '_'
+        }
+    }
+    
+    # Ensure it's not empty and doesn't start with dot
+    if ([string]::IsNullOrEmpty($safeFileName) -or $safeFileName.StartsWith('.')) {
+        $safeFileName = 'restored_file_' + $safeFileName
+    }
+    
+    # Limit length
+    if ($safeFileName.Length -gt 255) {
+        $safeFileName = $safeFileName.Substring(0, 255)
+    }
+    
+    return $safeFileName
 }
 
 function Set-ClipboardMultipleFormats {
