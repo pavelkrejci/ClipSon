@@ -71,8 +71,8 @@ if (-not (Test-NextcloudConnection -Connection $global:webdavConnection)) {
 # Local file paths - make them global so modules can access them
 $hostname = $env:COMPUTERNAME
 $global:localSyncFile = ".\clipboard-$hostname.json"
-$global:localSyncFileGz = ".\clipboard-$hostname.json.gz"
-$global:localUploadPath = $global:Config.nextcloud.remote_folder + "clipboard-$hostname.json.gz"
+$global:localSyncFile7z = ".\clipboard-$hostname.cpsn"
+$global:localUploadPath = $global:Config.nextcloud.remote_folder + "clipboard-$hostname.cpsn"
 
 # Global variables
 $global:fileCounter = 0
@@ -128,7 +128,7 @@ $handler = {
                 $uploadJson = ConvertTo-Json $uploadContent -Depth 10
                 
                 # Upload to WebDAV
-                Upload-ToWebDAV -Content $uploadJson -Connection $global:webdavConnection -LocalSyncFile $localSyncFile -LocalSyncFileGz $localSyncFileGz -RemoteFilePath $localUploadPath
+                Upload-ToWebDAV -Content $uploadJson -Connection $global:webdavConnection -LocalSyncFile $localSyncFile -LocalSyncFile7z $localSyncFile7z -RemoteFilePath $localUploadPath
                 
                 # Show notification for image capture
                 Show-ClipboardNotification -Title "ClipSon" -Message "Image captured: $filename" -Icon "Info"
@@ -231,7 +231,7 @@ $handler = {
                 $uploadJson = ConvertTo-Json $uploadContent -Depth 10
                 
                 # Upload to WebDAV
-                Upload-ToWebDAV -Content $uploadJson -Connection $global:webdavConnection -LocalSyncFile $localSyncFile -LocalSyncFileGz $localSyncFileGz -RemoteFilePath $localUploadPath
+                Upload-ToWebDAV -Content $uploadJson -Connection $global:webdavConnection -LocalSyncFile $localSyncFile -LocalSyncFile7z $localSyncFile7z -RemoteFilePath $localUploadPath
                 
                 # Show notification for local clipboard capture
                 $preview = if ($currentContent.Length -gt 50) { $currentContent.Substring(0, 50) + "..." } else { $currentContent }

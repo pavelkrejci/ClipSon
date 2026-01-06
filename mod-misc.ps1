@@ -35,6 +35,130 @@ function Get-PasswordIfNeeded {
     }
 }
 
+function Get-7zExecutablePath {
+    # Prefer known install locations, then fall back to PATH
+    $isWindows = $env:OS -eq 'Windows_NT'
+
+    if ($isWindows) {
+        $preferred = "C:\Program Files\7-Zip\7z.exe"
+        if (Test-Path $preferred) { return $preferred }
+    } else {
+        $preferred = "/usr/bin/7z"
+        if (Test-Path $preferred) { return $preferred }
+    }
+
+    $cmd = Get-Command 7z -ErrorAction SilentlyContinue
+    if ($cmd -and $cmd.Source) { return $cmd.Source }
+
+    throw "7z executable not found (expected $preferred or 7z in PATH)"
+}
+
+function Test-HasCpsnHeader {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$Path
+    )
+    try {
+        if (-not (Test-Path $Path)) { return $false }
+        $fs = [System.IO.File]::OpenRead($Path)
+        try {
+            if ($fs.Length -lt 4) { return $false }
+            $buf = New-Object byte[] 4
+            $read = $fs.Read($buf, 0, 4)
+            if ($read -ne 4) { return $false }
+            $sig = [System.Text.Encoding]::ASCII.GetString($buf)
+            return ($sig -eq "CPSN")
+        }
+        finally {
+            $fs.Close()
+        }
+    }
+    catch {
+        return $false
+    }
+}
+
+function Add-CpsnHeaderToFile {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$Path
+    )
+
+    if (Test-HasCpsnHeader -Path $Path) {
+        if ($global:Config -and $global:Config.app.debug_enabled) {
+            Write-DebugMsg "CPSN header already present: $Path"
+        }
+        return
+    }
+
+    $dir = Split-Path -Parent $Path
+    $tmp = Join-Path $dir ("." + ([System.IO.Path]::GetFileName($Path)) + "." + [System.Guid]::NewGuid().ToString("N") + ".cpsn")
+
+    $prefix = [System.Text.Encoding]::ASCII.GetBytes("CPSN")
+    $inStream = [System.IO.File]::OpenRead($Path)
+    try {
+        $outStream = [System.IO.File]::Create($tmp)
+        try {
+            $outStream.Write($prefix, 0, $prefix.Length)
+            $inStream.CopyTo($outStream)
+        }
+        finally {
+            $outStream.Close()
+        }
+    }
+    finally {
+        $inStream.Close()
+    }
+
+    Move-Item -LiteralPath $tmp -Destination $Path -Force
+
+    if ($global:Config -and $global:Config.app.debug_enabled) {
+        Write-DebugMsg "Prepended CPSN header: $Path"
+    }
+}
+
+function Strip-CpsnHeaderToFile {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$InputPath,
+        [Parameter(Mandatory=$true)]
+        [string]$OutputPath
+    )
+
+    $inStream = [System.IO.File]::OpenRead($InputPath)
+    try {
+        $buf = New-Object byte[] 4
+        $read = $inStream.Read($buf, 0, 4)
+        $sig = if ($read -eq 4) { [System.Text.Encoding]::ASCII.GetString($buf) } else { "" }
+
+        $outStream = [System.IO.File]::Create($OutputPath)
+        try {
+            if ($sig -eq "CPSN") {
+                # Copy remaining bytes (after header)
+                $inStream.CopyTo($outStream)
+                if ($global:Config -and $global:Config.app.debug_enabled) {
+                    Write-DebugMsg "Detected CPSN header; stripped to: $OutputPath"
+                }
+            } else {
+                # Not CPSN: write back the bytes we already read then rest
+                if ($read -gt 0) {
+                    $outStream.Write($buf, 0, $read)
+                }
+                $inStream.CopyTo($outStream)
+                if ($global:Config -and $global:Config.app.debug_enabled) {
+                    Write-DebugMsg "No CPSN header; copied archive to: $OutputPath"
+                }
+            }
+        }
+        finally {
+            $outStream.Close()
+        }
+    }
+    finally {
+        $inStream.Close()
+    }
+}
+
 function Compress-JsonFile {
     param(
         [Parameter(Mandatory=$true)]
@@ -43,22 +167,65 @@ function Compress-JsonFile {
         [string]$GzFile
     )
     try {
-        $jsonBytes = [System.IO.File]::ReadAllBytes($JsonFile)
-        $originalSize = $jsonBytes.Length
-        $fileStream = [System.IO.File]::Create($GzFile)
-        $gzipStream = New-Object System.IO.Compression.GzipStream($fileStream, [System.IO.Compression.CompressionLevel]::Fastest)
-        $gzipStream.Write($jsonBytes, 0, $jsonBytes.Length)
-        $gzipStream.Close()
-        $fileStream.Close()
-        $compressedSize = (Get-Item $GzFile).Length
-        if ($global:Config.app.debug_enabled) {
-            $ratio = if ($originalSize -gt 0) { (1 - $compressedSize / $originalSize) * 100 } else { 0 }
-            Write-DebugMsg "File compression $originalSize -> $compressedSize bytes ($([Math]::Round($ratio, 1))% saved)"
+        $sevenZip = Get-7zExecutablePath
+        $password = $global:Config.nextcloud.password
+        if ([string]::IsNullOrWhiteSpace($password)) {
+            throw "Nextcloud password is empty; cannot encrypt"
         }
-        return $true
+
+        $originalSize = (Get-Item $JsonFile).Length
+
+        $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("clipson-7z-" + [System.Guid]::NewGuid().ToString("N"))
+        New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
+
+        try {
+            # Put a stable name inside the archive.
+            $payloadPath = Join-Path $tempDir "payload.json"
+            Copy-Item -LiteralPath $JsonFile -Destination $payloadPath -Force
+
+            if (Test-Path $GzFile) {
+                Remove-Item -LiteralPath $GzFile -Force -ErrorAction SilentlyContinue
+            }
+
+            # Note: keep legacy .gz naming, but output is a 7z-encrypted archive.
+            $args = @(
+                "a",
+                "-t7z",
+                "-mhe=on",
+                "-y",
+                "-bd",
+                ("-p" + $password),
+                $GzFile,
+                $payloadPath
+            )
+
+            $output = & $sevenZip @args 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                if ($global:Config.app.debug_enabled) {
+                    Write-DebugMsg "7z encryption failed (exit $LASTEXITCODE): $output"
+                } else {
+                    Write-DebugMsg "7z encryption failed (exit $LASTEXITCODE)"
+                }
+                return $false
+            }
+
+            # Prefix the produced archive bytes with CPSN.
+            Add-CpsnHeaderToFile -Path $GzFile
+
+            $encryptedSize = (Get-Item $GzFile).Length
+            if ($global:Config.app.debug_enabled) {
+                $ratio = if ($originalSize -gt 0) { (1 - $encryptedSize / $originalSize) * 100 } else { 0 }
+                Write-DebugMsg "File encryption $originalSize -> $encryptedSize bytes ($([Math]::Round($ratio, 1))% smaller)"
+            }
+
+            return $true
+        }
+        finally {
+            Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
     catch {
-        Write-DebugMsg "File compression failed: $($_.Exception.Message)"
+        Write-DebugMsg "File encryption failed: $($_.Exception.Message)"
         return $false
     }
 }
@@ -71,17 +238,62 @@ function Decompress-GzFile {
         [string]$JsonFile
     )
     try {
-        $fileStream = [System.IO.File]::OpenRead($GzFile)
-        $gzipStream = New-Object System.IO.Compression.GzipStream($fileStream, [System.IO.Compression.CompressionMode]::Decompress)
-        $outputStream = [System.IO.File]::Create($JsonFile)
-        $gzipStream.CopyTo($outputStream)
-        $outputStream.Close()
-        $gzipStream.Close()
-        $fileStream.Close()
-        return $true
+        $sevenZip = Get-7zExecutablePath
+        $password = $global:Config.nextcloud.password
+        if ([string]::IsNullOrWhiteSpace($password)) {
+            throw "Nextcloud password is empty; cannot decrypt"
+        }
+
+        $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("clipson-7z-" + [System.Guid]::NewGuid().ToString("N"))
+        New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
+
+        try {
+            # If the archive is CPSN-prefixed, strip it to a real 7z file before extraction.
+            $archiveToExtract = $GzFile
+            $strippedArchive = Join-Path $tempDir "archive.7z"
+            Strip-CpsnHeaderToFile -InputPath $GzFile -OutputPath $strippedArchive
+            $archiveToExtract = $strippedArchive
+
+            $args = @(
+                "x",
+                "-y",
+                "-bd",
+                ("-p" + $password),
+                ("-o" + $tempDir),
+                $archiveToExtract
+            )
+
+            $output = & $sevenZip @args 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                if ($global:Config.app.debug_enabled) {
+                    Write-DebugMsg "7z decryption failed (exit $LASTEXITCODE): $output"
+                } else {
+                    Write-DebugMsg "7z decryption failed (exit $LASTEXITCODE)"
+                }
+                return $false
+            }
+
+            $payload = Join-Path $tempDir "payload.json"
+            if (-not (Test-Path $payload)) {
+                # Fallback: pick first extracted file
+                $first = Get-ChildItem -Path $tempDir -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+                if (-not $first) {
+                    Write-DebugMsg "7z decryption produced no files"
+                    return $false
+                }
+                Copy-Item -LiteralPath $first.FullName -Destination $JsonFile -Force
+                return $true
+            }
+
+            Copy-Item -LiteralPath $payload -Destination $JsonFile -Force
+            return $true
+        }
+        finally {
+            Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
     catch {
-        Write-DebugMsg "File decompression failed: $($_.Exception.Message)"
+        Write-DebugMsg "File decryption failed: $($_.Exception.Message)"
         return $false
     }
 }

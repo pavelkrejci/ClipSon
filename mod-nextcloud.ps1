@@ -80,12 +80,25 @@ function Send-FileToNextcloud {
     )
     
     try {
+        if ($global:Config -and $global:Config.app.debug_enabled) {
+            Write-DebugMsg "Send-FileToNextcloud: LocalFilePath='$LocalFilePath', RemoteFilePath='$RemoteFilePath'"
+        }
+
         if (-not (Test-Path $LocalFilePath)) {
             throw "Local file not found: $LocalFilePath"
+        }
+
+        $localSize = (Get-Item $LocalFilePath).Length
+        if ($global:Config -and $global:Config.app.debug_enabled) {
+            Write-DebugMsg "Send-FileToNextcloud: Local file size: $localSize bytes"
         }
         
         $RemoteFilePath = $RemoteFilePath.TrimStart('/')
         $UploadUrl = $Connection.WebDAVUrl + $RemoteFilePath
+        if ($global:Config -and $global:Config.app.debug_enabled) {
+            Write-DebugMsg "Send-FileToNextcloud: PUT $UploadUrl"
+        }
+
         $FileContent = [System.IO.File]::ReadAllBytes($LocalFilePath)
         
         $WebRequest = [System.Net.WebRequest]::Create($UploadUrl)
@@ -103,6 +116,10 @@ function Send-FileToNextcloud {
         $Response = $WebRequest.GetResponse()
         $StatusCode = $Response.StatusCode
         $Response.Close()
+
+        if ($global:Config -and $global:Config.app.debug_enabled) {
+            Write-DebugMsg "Send-FileToNextcloud: Response status: $StatusCode"
+        }
         
         if ($StatusCode -eq "Created" -or $StatusCode -eq "NoContent") {
             Write-DebugMsg "Successfully uploaded: $LocalFilePath -> $RemoteFilePath"
@@ -112,7 +129,42 @@ function Send-FileToNextcloud {
             return $false
         }
     }
+    catch [System.Net.WebException] {
+        $status = $null
+        $body = $null
+
+        try {
+            if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
+                $status = $_.Exception.Response.StatusCode
+            }
+        } catch { }
+
+        try {
+            if ($_.Exception.Response) {
+                $stream = $_.Exception.Response.GetResponseStream()
+                if ($stream) {
+                    $reader = New-Object System.IO.StreamReader($stream)
+                    $body = $reader.ReadToEnd()
+                    $reader.Close()
+                }
+            }
+        } catch { }
+
+        if ($global:Config -and $global:Config.app.debug_enabled) {
+            Write-DebugMsg "Upload failed (WebException). Status='$status' Message='$($_.Exception.Message)'"
+            if ($body) {
+                $preview = if ($body.Length -gt 500) { $body.Substring(0, 500) + '...' } else { $body }
+                Write-DebugMsg "Upload error response body (preview): $preview"
+            }
+        }
+
+        Write-Error "Upload failed: $($_.Exception.Message)"
+        return $false
+    }
     catch {
+        if ($global:Config -and $global:Config.app.debug_enabled) {
+            Write-DebugMsg "Upload failed (Exception): $($_.Exception.Message)"
+        }
         Write-Error "Upload failed: $($_.Exception.Message)"
         return $false
     }
@@ -364,7 +416,7 @@ function Get-RemoteClipboardFiles {
             $displayNameNode = $node.SelectSingleNode(".//D:displayname", $NamespaceManager)
             $lastModifiedNode = $node.SelectSingleNode(".//D:getlastmodified", $NamespaceManager)
             
-            if ($displayNameNode -and $displayNameNode.InnerText -match "^clipboard-.*\.json\.gz$") {
+            if ($displayNameNode -and $displayNameNode.InnerText -match "^clipboard-.*\.cpsn$") {
                 $lastModified = $null
                 if ($lastModifiedNode -and $lastModifiedNode.InnerText) {
                     try {
@@ -398,7 +450,7 @@ function Select-RemoteSyncFile {
     $remoteFiles = Get-RemoteClipboardFiles -Connection $Connection -RemoteFolder $RemoteFolder
     
     $hostname = $env:COMPUTERNAME
-    $myFile = "clipboard-$hostname.json.gz"
+    $myFile = "clipboard-$hostname.cpsn"
     
     $filteredFiles = @()
     foreach ($file in $remoteFiles) {
@@ -460,11 +512,11 @@ function Check-AllRemoteFilesForUpdates {
         
         $remoteFiles = Get-RemoteClipboardFiles -Connection $Connection -RemoteFolder $RemoteFolder
         $hostname = $env:COMPUTERNAME
-        $myFile = "clipboard-$hostname.json.gz"
+        $myFile = "clipboard-$hostname.cpsn"
         
         $peerFiles = @()
         foreach ($file in $remoteFiles) {
-            if ($file.Name -ne $myFile -and $file.Name -match "^clipboard-.*\.json\.gz$") {
+            if ($file.Name -ne $myFile -and $file.Name -match "^clipboard-.*\.cpsn$") {
                 $peerFiles += $file
             }
         }
@@ -497,8 +549,8 @@ function Check-AllRemoteFilesForUpdates {
                     Write-Host "$(Get-Date -Format 'HH:mm:ss') - Remote file updated: $filename" -ForegroundColor Cyan
                 }
                 
-                $tempDownloadFileGz = ".\temp-remote-download-$($filename.Replace('.json.gz', '')).json.gz"
-                $tempDownloadFileJson = ".\temp-remote-download-$($filename.Replace('.json.gz', '')).json"
+                $tempDownloadFileGz = ".\temp-remote-download-$($filename.Replace('.cpsn', '')).cpsn"
+                $tempDownloadFileJson = ".\temp-remote-download-$($filename.Replace('.cpsn', '')).json"
                 $remotePath = $RemoteFolder + $filename
                 
                 $downloadResult = Get-NextcloudFile -Connection $Connection -RemoteFilePath $remotePath -LocalFilePath $tempDownloadFileGz -IncludeTimestamp
@@ -560,12 +612,15 @@ function global:Upload-ToWebDAV {
         [string]$Content,
         [hashtable]$Connection,
         [string]$LocalSyncFile,
-        [string]$LocalSyncFileGz,
+        [string]$LocalSyncFile7z,
         [string]$RemoteFilePath
     )
     
     try {
         Write-DebugMsg "Uploading content length: $($Content.Length) to file: $LocalSyncFile"
+        if ($global:Config -and $global:Config.app.debug_enabled) {
+            Write-DebugMsg "Upload-ToWebDAV: LocalSyncFile7z='$LocalSyncFile7z' RemoteFilePath='$RemoteFilePath'"
+        }
         
         if ([string]::IsNullOrEmpty($Content)) {
             Write-Warning "$(Get-Date -Format 'HH:mm:ss') - Content is null or empty, skipping upload"
@@ -604,19 +659,41 @@ function global:Upload-ToWebDAV {
             } else {
                 Write-DebugMsg "File written successfully, length verified: $($writtenContent.Length)"
             }
+
+            if (Test-Path $LocalSyncFile) {
+                $jsonSize = (Get-Item $LocalSyncFile).Length
+                Write-DebugMsg "Upload-ToWebDAV: JSON file size: $jsonSize bytes"
+            }
         }
-        
-        if (Compress-JsonFile -JsonFile $LocalSyncFile -GzFile $LocalSyncFileGz) {
-            $uploadResult = Send-FileToNextcloud -Connection $Connection -LocalFilePath $LocalSyncFileGz -RemoteFilePath $RemoteFilePath
+
+        $encryptOk = Compress-JsonFile -JsonFile $LocalSyncFile -GzFile $LocalSyncFile7z
+
+        if ($global:Config -and $global:Config.app.debug_enabled) {
+            Write-DebugMsg "Upload-ToWebDAV: Encrypt result: $encryptOk"
+            if (Test-Path $LocalSyncFile7z) {
+                $encSize = (Get-Item $LocalSyncFile7z).Length
+                Write-DebugMsg "Upload-ToWebDAV: Encrypted file exists, size: $encSize bytes"
+            } else {
+                Write-DebugMsg "Upload-ToWebDAV: Encrypted file does NOT exist: $LocalSyncFile7z"
+            }
+        }
+
+        if ($encryptOk) {
+            $uploadResult = Send-FileToNextcloud -Connection $Connection -LocalFilePath $LocalSyncFile7z -RemoteFilePath $RemoteFilePath
             
             if ($uploadResult) {
-                Write-Host "$(Get-Date -Format 'HH:mm:ss') - Uploaded compressed to WebDAV: $RemoteFilePath"
+                Write-Host "$(Get-Date -Format 'HH:mm:ss') - Uploaded encrypted to WebDAV: $RemoteFilePath"
                 
                 if (Test-Path $LocalSyncFile) {
                     $global:lastClipboardFileModified = (Get-Item $LocalSyncFile).LastWriteTime
                 }
                 
                 return $true
+            }
+        }
+        else {
+            if ($global:Config -and $global:Config.app.debug_enabled) {
+                Write-DebugMsg "Upload-ToWebDAV: Skipping upload because encryption failed."
             }
         }
         

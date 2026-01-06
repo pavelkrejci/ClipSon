@@ -252,7 +252,7 @@ function global:Save-ClipboardFiles {
             $uploadJson = ConvertTo-Json $uploadContent -Depth 10
             
             # Upload to WebDAV
-            Upload-ToWebDAV -Content $uploadJson -Connection $global:webdavConnection -LocalSyncFile $global:localSyncFile -LocalSyncFileGz $global:localSyncFileGz -RemoteFilePath $global:localUploadPath
+            Upload-ToWebDAV -Content $uploadJson -Connection $global:webdavConnection -LocalSyncFile $global:localSyncFile -LocalSyncFile7z $global:localSyncFile7z -RemoteFilePath $global:localUploadPath
             
             # Show notification
             $fileNames = $filesData.Keys | Select-Object -First 3
@@ -309,7 +309,7 @@ function Get-MimeType {
             '.avi' = 'video/x-msvideo'
             '.zip' = 'application/zip'
             '.rar' = 'application/x-rar-compressed'
-            '.7z' = 'application/x-7z-compressed'
+            '.cpsn' = 'application/octet-stream'
             '.exe' = 'application/x-msdownload'
             '.msi' = 'application/x-msi'
         }
@@ -518,8 +518,7 @@ function Set-ClipboardMultipleFormats {
                 try {
                     $content = $FormatData.$formatName
                     $windowsFormat = $formatMap[$formatName]
-                    
-                    # Enhanced debugging for content issues
+
                     if ($global:Config -and $global:Config.app.debug_enabled) {
                         Write-DebugMsg "Format $formatName - Content type: $($content.GetType().Name), Length: $($content.Length), WindowsFormat: $windowsFormat"
                         Write-DebugMsg "Content preview: '$($content.Substring(0, [Math]::Min(100, $content.Length)))'..."
@@ -737,7 +736,7 @@ function global:Save-ClipboardRichContentJson {
             }
             
             # Upload to WebDAV
-            Upload-ToWebDAV -Content $uploadJson -Connection $global:webdavConnection -LocalSyncFile $global:localSyncFile -LocalSyncFileGz $global:localSyncFileGz -RemoteFilePath $global:localUploadPath
+            Upload-ToWebDAV -Content $uploadJson -Connection $global:webdavConnection -LocalSyncFile $global:localSyncFile -LocalSyncFile7z $global:localSyncFile7z -RemoteFilePath $global:localUploadPath
             
             # Show notification
             $formatList = ($FormatData.Keys | Select-Object -First 3) -join ', '

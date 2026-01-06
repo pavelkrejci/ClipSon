@@ -19,7 +19,7 @@ Nextcloud clipboard synchronization tool for Linux (Python) and Windows (PowerSh
 
 0. copy the `config_template.json` file to `config.json` and edit it to set your Nextcloud WebDAV URL, username, and password, proxy, etc.
 
-**Important:** All ClipSon instances across different devices (Windows, Linux, etc.) must be configured with the same Nextcloud account credentials to synchronize clipboard content between them. Each device will create its own clipboard file (e.g., `clipboard-hostname.txt`) in the shared Nextcloud folder, allowing all instances to monitor and sync changes from other devices.
+**Important:** All ClipSon instances across different devices (Windows, Linux, etc.) must be configured with the same Nextcloud account credentials to synchronize clipboard content between them. Each device will create its own encrypted clipboard sync file (e.g., `clipboard-hostname.cpsn`) in the shared Nextcloud folder, allowing all instances to monitor and sync changes from other devices.
 
 ### Windows (PowerShell)
 
@@ -88,6 +88,7 @@ Nextcloud clipboard synchronization tool for Linux (Python) and Windows (PowerSh
 ### Windows
 - Windows PowerShell 5.1 or later
 - .NET Framework (usually pre-installed on Windows)
+- 7-Zip (7z) installed at `C:\Program Files\7-Zip\7z.exe`
 - Nextcloud account and credentials
 
 ### Linux
@@ -98,7 +99,13 @@ Nextcloud clipboard synchronization tool for Linux (Python) and Windows (PowerSh
   - xclip (required for basic clipboard operations)
   - notify-send/libnotify-bin (required for desktop notifications)
   - copyq (optional, for enhanced multi-MIME clipboard support)
+   - 7z installed at `/usr/bin/7z`
 - Nextcloud account and credentials
+
+### Security note
+
+Clipboard payloads uploaded to WebDAV are encrypted using 7z with a password.
+The password used is the same value as `nextcloud.password` from `config.json`.
 
 ## Known Issues
 

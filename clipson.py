@@ -18,12 +18,16 @@ import requests
 from requests.auth import HTTPBasicAuth
 import signal
 import getpass
-import gzip
 import base64
 import hashlib
 import re
 import urllib.parse
 import mimetypes
+import tempfile
+import shutil
+import uuid
+
+CPSN_MAGIC = b'CPSN'
 
 def load_configuration():
     """Load configuration from JSON file"""
@@ -95,10 +99,10 @@ class ClipSon:
         self.webdav_base_url = f"{CONFIG['server_url'].rstrip('/')}/remote.php/dav/files/{CONFIG['username']}/"
         self.auth = HTTPBasicAuth(CONFIG['username'], CONFIG['password'])
         
-        # File paths - now using .json.gz extension for compressed transfer
+        # File paths - using .cpsn extension for encrypted transfer
         self.local_sync_file = Path(f'./clipboard-{self.hostname}.json')
-        self.local_sync_file_gz = Path(f'./clipboard-{self.hostname}.json.gz')
-        self.local_upload_file = f"clipboard-{self.hostname}.json.gz"
+        self.local_sync_file_7z = Path(f'./clipboard-{self.hostname}.cpsn')
+        self.local_upload_file = f"clipboard-{self.hostname}.cpsn"
         
         # Setup signal handler
         signal.signal(signal.SIGINT, self.signal_handler)
@@ -292,9 +296,9 @@ class ClipSon:
                     with open(self.local_sync_file, 'w', encoding='utf-8') as f:
                         f.write(upload_json)
                     
-                    if self.compress_json_file(self.local_sync_file, self.local_sync_file_gz):
-                        if self.upload_to_webdav(self.local_sync_file_gz, self.local_upload_file):
-                            print(f"{datetime.now().strftime('%H:%M:%S')} - Uploaded compressed files to WebDAV: {self.local_upload_file}")
+                        if self.compress_json_file(self.local_sync_file, self.local_sync_file_7z):
+                            if self.upload_to_webdav(self.local_sync_file_7z, self.local_upload_file):
+                                print(f"{datetime.now().strftime('%H:%M:%S')} - Uploaded encrypted files to WebDAV: {self.local_upload_file}")
                 
                 # Show notification
                 file_names = list(files_data.keys())[:3]
@@ -322,41 +326,172 @@ class ClipSon:
         # Fallback to application/octet-stream
         return "application/octet-stream"
 
+    def _get_7z_executable(self):
+        """Return path to 7z executable (Linux)."""
+        preferred = Path('/usr/bin/7z')
+        if preferred.exists():
+            return str(preferred)
+
+        found = shutil.which('7z')
+        if found:
+            return found
+
+        raise FileNotFoundError("7z executable not found (expected /usr/bin/7z or 7z in PATH)")
+
     def compress_json_file(self, json_file, gz_file):
-        """Compress JSON file to .gz format"""
+        """Encrypt JSON file into a 7z archive using the Nextcloud password.
+
+        The resulting file is a password-encrypted 7z archive.
+        """
         try:
-            with open(json_file, 'rb') as f_in:
-                with gzip.open(gz_file, 'wb', compresslevel=1) as f_out:  # Fast compression
-                    original_size = 0
-                    while True:
-                        chunk = f_in.read(8192)
-                        if not chunk:
-                            break
-                        f_out.write(chunk)
-                        original_size += len(chunk)
-            
-            compressed_size = gz_file.stat().st_size
-            ratio = (1 - compressed_size / original_size) * 100 if original_size > 0 else 0
-            debug_print(f"File compression {original_size} -> {compressed_size} bytes ({ratio:.1f}% saved)")
-            
+            json_path = Path(json_file).resolve()
+            archive_path = Path(gz_file).resolve()
+
+            seven_zip = self._get_7z_executable()
+            password = CONFIG.get('password', '')
+            if not str(password).strip():
+                raise ValueError("Nextcloud password is empty; cannot encrypt")
+
+            original_size = json_path.stat().st_size
+
+            # Create payload in a temp directory, but create the archive temp file
+            # in the *destination directory* so we can atomically replace it without
+            # cross-device rename issues (e.g., /tmp on different filesystem).
+            tmp_archive_path = None
+            try:
+                with tempfile.TemporaryDirectory(prefix='clipson-7z-') as tmpdir:
+                    tmpdir_path = Path(tmpdir)
+                    payload_name = 'payload.json'
+                    payload_path = tmpdir_path / payload_name
+                    shutil.copyfile(json_path, payload_path)
+
+                    # IMPORTANT: 7z fails if the target file exists but isn't a valid archive.
+                    # So generate a temp path in the destination directory that does not exist.
+                    tmp_archive_path = archive_path.parent / f"{archive_path.name}.{uuid.uuid4().hex}.tmp"
+                    if tmp_archive_path.exists():
+                        tmp_archive_path.unlink()
+
+                    # -mhe=on encrypts file names/headers; -p sets password.
+                    # Avoid printing password in debug output.
+                    args = [
+                        seven_zip, 'a', '-t7z', '-mhe=on', f'-p{password}',
+                        '-y', '-bd', str(tmp_archive_path), payload_name
+                    ]
+
+                    result = subprocess.run(
+                        args,
+                        cwd=str(tmpdir_path),
+                        capture_output=True,
+                        text=True
+                    )
+
+                    if result.returncode != 0:
+                        combined = (result.stderr or '').strip()
+                        if result.stdout and result.stdout.strip():
+                            combined = (combined + "\n" + result.stdout.strip()).strip()
+                        debug_print(f"7z encryption failed (exit {result.returncode}): {combined}")
+                        return False
+
+                # Some 7z builds may append .7z when the output name has no .7z.
+                if not tmp_archive_path.exists():
+                    candidate1 = tmp_archive_path.with_name(tmp_archive_path.name + '.7z')
+                    candidate2 = tmp_archive_path.with_suffix(tmp_archive_path.suffix + '.7z')
+                    if candidate1.exists():
+                        tmp_archive_path = candidate1
+                    elif candidate2.exists():
+                        tmp_archive_path = candidate2
+
+                os.replace(str(tmp_archive_path), str(archive_path))
+            finally:
+                if tmp_archive_path and tmp_archive_path.exists():
+                    try:
+                        tmp_archive_path.unlink()
+                    except Exception:
+                        pass
+
+            # Prepend CPSN signature to the resulting archive.
+            # (Remote sync files are CPSN + raw 7z bytes.)
+            try:
+                with open(archive_path, 'rb') as f_in:
+                    head = f_in.read(4)
+
+                if head != CPSN_MAGIC:
+                    prefixed_tmp = archive_path.parent / f"{archive_path.name}.{uuid.uuid4().hex}.cpsn"
+                    with open(archive_path, 'rb') as f_in, open(prefixed_tmp, 'wb') as f_out:
+                        f_out.write(CPSN_MAGIC)
+                        shutil.copyfileobj(f_in, f_out, length=1024 * 1024)
+                    os.replace(str(prefixed_tmp), str(archive_path))
+            except Exception as e:
+                debug_print(f"Warning: failed to prepend CPSN header: {e}")
+                return False
+
+            encrypted_size = archive_path.stat().st_size
+            ratio = (1 - encrypted_size / original_size) * 100 if original_size > 0 else 0
+            debug_print(f"File encryption {original_size} -> {encrypted_size} bytes ({ratio:.1f}% smaller)")
+
             return True
         except Exception as e:
-            debug_print(f"File compression failed: {e}")
+            debug_print(f"File encryption failed: {e}")
             return False
 
     def decompress_gz_file(self, gz_file, json_file):
-        """Decompress .gz file to JSON format"""
+        """Decrypt a CPSN-prefixed 7z-encrypted archive back into JSON.
+
+        If the file does not start with CPSN, it is treated as a raw 7z archive
+        for backward compatibility.
+        """
         try:
-            with gzip.open(gz_file, 'rb') as f_in:
-                with open(json_file, 'wb') as f_out:
-                    while True:
-                        chunk = f_in.read(8192)
-                        if not chunk:
-                            break
-                        f_out.write(chunk)
-            return True
+            archive_path = Path(gz_file).resolve()
+            json_path = Path(json_file).resolve()
+
+            seven_zip = self._get_7z_executable()
+            password = CONFIG.get('password', '')
+            if not str(password).strip():
+                raise ValueError("Nextcloud password is empty; cannot decrypt")
+
+            with tempfile.TemporaryDirectory(prefix='clipson-7z-') as tmpdir:
+                tmpdir_path = Path(tmpdir)
+                out_dir_arg = f"-o{tmpdir_path}"  # 7z expects -o<dir>
+
+                # Strip CPSN prefix if present.
+                archive_to_extract = archive_path
+                with open(archive_path, 'rb') as f_in:
+                    head = f_in.read(4)
+                    if head == CPSN_MAGIC:
+                        stripped_path = tmpdir_path / 'archive.7z'
+                        with open(stripped_path, 'wb') as f_out:
+                            shutil.copyfileobj(f_in, f_out, length=1024 * 1024)
+                        archive_to_extract = stripped_path
+
+                args = [
+                    seven_zip, 'x', '-y', '-bd', f'-p{password}', out_dir_arg, str(archive_to_extract)
+                ]
+                result = subprocess.run(
+                    args,
+                    capture_output=True,
+                    text=True
+                )
+
+                if result.returncode != 0:
+                    debug_print(f"7z decryption failed (exit {result.returncode}): {result.stderr.strip()}")
+                    return False
+
+                payload_path = tmpdir_path / 'payload.json'
+                if payload_path.exists():
+                    shutil.copyfile(payload_path, json_path)
+                    return True
+
+                # Fallback: pick the first extracted file.
+                extracted_files = [p for p in tmpdir_path.rglob('*') if p.is_file()]
+                if not extracted_files:
+                    debug_print("7z decryption produced no files")
+                    return False
+
+                shutil.copyfile(extracted_files[0], json_path)
+                return True
+
         except Exception as e:
-            debug_print(f"File decompression failed: {e}")
+            debug_print(f"File decryption failed: {e}")
             return False
 
     def save_clipboard_image(self):
@@ -402,13 +537,13 @@ class ClipSon:
                     }
                     upload_json = json.dumps(upload_content, ensure_ascii=False, indent=2)
                     
-                    # Save to local sync file, compress, and upload
+                    # Save to local sync file, encrypt, and upload
                     with open(self.local_sync_file, 'w', encoding='utf-8') as f:
                         f.write(upload_json)
                     
-                    if self.compress_json_file(self.local_sync_file, self.local_sync_file_gz):
-                        if self.upload_to_webdav(self.local_sync_file_gz, self.local_upload_file):
-                            print(f"{datetime.now().strftime('%H:%M:%S')} - Uploaded compressed image to WebDAV: {self.local_upload_file}")
+                    if self.compress_json_file(self.local_sync_file, self.local_sync_file_7z):
+                        if self.upload_to_webdav(self.local_sync_file_7z, self.local_upload_file):
+                            print(f"{datetime.now().strftime('%H:%M:%S')} - Uploaded encrypted image to WebDAV: {self.local_upload_file}")
                 
                 # Show notification
                 self.show_notification("ClipSon", f"Image captured: {filename}")
@@ -463,8 +598,8 @@ class ClipSon:
                 
                 if displayname_elem is not None and displayname_elem.text:
                     filename = displayname_elem.text
-                    # Now looking for .json.gz files
-                    if filename.startswith('clipboard-') and filename.endswith('.json.gz'):
+                    # Now looking for .cpsn files
+                    if filename.startswith('clipboard-') and filename.endswith('.cpsn'):
                         last_modified = None
                         if lastmodified_elem is not None and lastmodified_elem.text:
                             try:
@@ -493,19 +628,19 @@ class ClipSon:
         print("Discovering remote clipboard files...")
         remote_files = self.get_remote_clipboard_files()
         
-        # Filter out our own file (compressed json.gz now)
+        # Filter out our own file
         base = f"clipboard-{self.hostname}"
-        peer_files = [f for f in remote_files if f['name'] != f"{base}.json.gz"]
+        peer_files = [f for f in remote_files if f['name'] != f"{base}.cpsn"]
         
         debug_print(f"Total remote files found: {len(remote_files)}")
         debug_print(f"My hostname: {self.hostname}")
-        debug_print(f"My file: {base}.json.gz")
+        debug_print(f"My file: {base}.cpsn")
         debug_print(f"All remote files: {[f['name'] for f in remote_files]}")
         debug_print(f"Filtered peer files count: {len(peer_files)}")
         
         if not peer_files:
             print("No remote clipboard files from other machines found.")
-            print(f"Will only upload to: {base}.json.gz")
+            print(f"Will only upload to: {base}.cpsn")
             return []
         
         print(f"\nFound {len(peer_files)} remote peer(s):")
@@ -598,10 +733,10 @@ class ClipSon:
         # Get current list of remote files
         remote_files = self.get_remote_clipboard_files()
         base = f"clipboard-{self.hostname}"
-        # Only look for .json.gz files now
-        peer_files = [f for f in remote_files if f['name'] != f"{base}.json.gz" and f['name'].startswith('clipboard-') and f['name'].endswith('.json.gz')]
+        # Only look for .cpsn files now
+        peer_files = [f for f in remote_files if f['name'] != f"{base}.cpsn" and f['name'].startswith('clipboard-') and f['name'].endswith('.cpsn')]
         
-        debug_print(f"Remote check - Total files: {len(remote_files)}, My file: {base}.json.gz, Peer files: {len(peer_files)}")
+        debug_print(f"Remote check - Total files: {len(remote_files)}, My file: {base}.cpsn, Peer files: {len(peer_files)}")
         
         most_recent_content = None
         most_recent_timestamp = 0
@@ -633,8 +768,8 @@ class ClipSon:
                     print(f"{datetime.now().strftime('%H:%M:%S')} - Remote file updated: {filename}")
                 
                 # Download and decompress
-                temp_download_file_gz = f'./temp-remote-download-{filename.replace(".json.gz", "")}.json.gz'
-                temp_download_file_json = f'./temp-remote-download-{filename.replace(".json.gz", "")}.json'
+                temp_download_file_gz = f'./temp-remote-download-{filename.replace(".cpsn", "")}.cpsn'
+                temp_download_file_json = f'./temp-remote-download-{filename.replace(".cpsn", "")}.json'
                 
                 if self.download_remote_file(filename, temp_download_file_gz):
                     try:
@@ -724,9 +859,9 @@ class ClipSon:
             with open(self.local_sync_file, 'w', encoding='utf-8') as f:
                 f.write(upload_json)
             
-            # Compress and upload
-            if self.compress_json_file(self.local_sync_file, self.local_sync_file_gz):
-                self.upload_to_webdav(self.local_sync_file_gz, self.local_upload_file)
+            # Encrypt and upload
+            if self.compress_json_file(self.local_sync_file, self.local_sync_file_7z):
+                self.upload_to_webdav(self.local_sync_file_7z, self.local_upload_file)
         
         # Show notification
         preview = content[:50] + "..." if len(content) > 50 else content
@@ -879,12 +1014,12 @@ class ClipSon:
                     }
                     upload_json = json.dumps(upload_content, ensure_ascii=False, indent=2)
                     
-                    # Save to local sync file, compress, and upload
+                    # Save to local sync file, encrypt, and upload
                     with open(self.local_sync_file, 'w', encoding='utf-8') as f:
                         f.write(upload_json)
                     
-                    if self.compress_json_file(self.local_sync_file, self.local_sync_file_gz):
-                        self.upload_to_webdav(self.local_sync_file_gz, self.local_upload_file)
+                    if self.compress_json_file(self.local_sync_file, self.local_sync_file_7z):
+                        self.upload_to_webdav(self.local_sync_file_7z, self.local_upload_file)
                 
                 # Show notification with unique format types
                 unique_extensions = list(set([ext for filename in saved_files for ext in [Path(filename).suffix]]))
