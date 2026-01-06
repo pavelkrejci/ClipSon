@@ -71,8 +71,8 @@ if (-not (Test-NextcloudConnection -Connection $global:webdavConnection)) {
 # Local file paths - make them global so modules can access them
 $hostname = $env:COMPUTERNAME
 $global:localSyncFile = ".\clipboard-$hostname.json"
-$global:localSyncFileGz = ".\clipboard-$hostname.json.gz"
-$global:localUploadPath = $global:Config.nextcloud.remote_folder + "clipboard-$hostname.json.gz"
+$global:localSyncFileGz = ".\clipboard-$hostname.cs"
+$global:localUploadPath = $global:Config.nextcloud.remote_folder + "clipboard-$hostname.cs"
 
 # Global variables
 $global:fileCounter = 0

@@ -14,6 +14,8 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 from datetime import timezone
 from pathlib import Path
+import struct
+import hmac
 import requests
 from requests.auth import HTTPBasicAuth
 import signal
@@ -95,10 +97,10 @@ class ClipSon:
         self.webdav_base_url = f"{CONFIG['server_url'].rstrip('/')}/remote.php/dav/files/{CONFIG['username']}/"
         self.auth = HTTPBasicAuth(CONFIG['username'], CONFIG['password'])
         
-        # File paths - now using .json.gz extension for compressed transfer
+        # File paths - using .cs extension for encrypted transfer
         self.local_sync_file = Path(f'./clipboard-{self.hostname}.json')
-        self.local_sync_file_gz = Path(f'./clipboard-{self.hostname}.json.gz')
-        self.local_upload_file = f"clipboard-{self.hostname}.json.gz"
+        self.local_sync_file_gz = Path(f'./clipboard-{self.hostname}.cs')
+        self.local_upload_file = f"clipboard-{self.hostname}.cs"
         
         # Setup signal handler
         signal.signal(signal.SIGINT, self.signal_handler)
@@ -323,37 +325,158 @@ class ClipSon:
         return "application/octet-stream"
 
     def compress_json_file(self, json_file, gz_file):
-        """Compress JSON file to .gz format"""
+        """Compress JSON file and encrypt it to the ClipSon CSGZ v1 container.
+
+        Note: output uses the .cs filename extension for WebDAV transport,
+        but it is NOT a raw gzip stream.
+        """
         try:
+            # Import here so the script can start up and give a clear error if missing.
+            try:
+                from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+                from cryptography.hazmat.primitives import padding
+            except Exception as e:
+                debug_print(f"Missing Python dependency 'cryptography' for encryption: {e}")
+                print("ERROR: Python package 'cryptography' is required for encrypted clipboard sync.")
+                print("Install it with: pip install -r requirements.txt")
+                return False
+
+            password = str(CONFIG_DATA.get('app', {}).get('encryption_password', '') or CONFIG.get('password', '') or '')
+            if not password or not str(password).strip():
+                debug_print("No Nextcloud password available for encryption")
+                return False
+
+            original_size = Path(json_file).stat().st_size
+
+            # 1) gzip compress to bytes
             with open(json_file, 'rb') as f_in:
-                with gzip.open(gz_file, 'wb', compresslevel=1) as f_out:  # Fast compression
-                    original_size = 0
-                    while True:
-                        chunk = f_in.read(8192)
-                        if not chunk:
-                            break
-                        f_out.write(chunk)
-                        original_size += len(chunk)
-            
-            compressed_size = gz_file.stat().st_size
-            ratio = (1 - compressed_size / original_size) * 100 if original_size > 0 else 0
-            debug_print(f"File compression {original_size} -> {compressed_size} bytes ({ratio:.1f}% saved)")
-            
+                plain = f_in.read()
+            gzip_bytes = gzip.compress(plain, compresslevel=1)
+
+            # 2) derive keys
+            iterations = 50000
+            salt = os.urandom(16)
+            iv = os.urandom(16)
+
+            # Compatibility choice:
+            # - PowerShell 5.1 may run on .NET Framework builds that don't support PBKDF2-HMAC-SHA256.
+            # - PBKDF2-HMAC-SHA1 is universally supported and still OK here because we also authenticate
+            #   ciphertext with HMAC-SHA256.
+            # The selected KDF is encoded in the file header so readers can handle both.
+            kdf_id = 1  # 1=sha1 (most compatible), 2=sha256
+            hash_name = 'sha256' if kdf_id == 2 else 'sha1'
+            key_material = hashlib.pbkdf2_hmac(hash_name, password.encode('utf-8'), salt, iterations, dklen=64)
+            enc_key = key_material[:32]
+            mac_key = key_material[32:]
+
+            # 3) AES-CBC encrypt (PKCS7)
+            padder = padding.PKCS7(128).padder()
+            padded = padder.update(gzip_bytes) + padder.finalize()
+            cipher = Cipher(algorithms.AES(enc_key), modes.CBC(iv)).encryptor()
+            ciphertext = cipher.update(padded) + cipher.finalize()
+
+            # 4) build container and HMAC (little-endian)
+            # Format (CSGZ v1): magic(4) + version(1) + kdf(1) + iter(u32) + saltLen(1) + ivLen(1)
+            #               + salt + iv + ciphertext + hmac(32)
+            # Readers are tolerant and can also handle legacy files that included an explicit u32 cipher_len.
+            header = b'CSGZ' + struct.pack('<BBIBB', 1, kdf_id, iterations, len(salt), len(iv))
+            to_mac = header + salt + iv + ciphertext
+            tag = hmac.new(mac_key, to_mac, hashlib.sha256).digest()
+
+            with open(gz_file, 'wb') as f_out:
+                f_out.write(to_mac)
+                f_out.write(tag)
+
+            final_size = Path(gz_file).stat().st_size
+            ratio = (1 - final_size / original_size) * 100 if original_size > 0 else 0
+            debug_print(f"File compress+encrypt {original_size} -> {final_size} bytes ({ratio:.1f}% saved)")
             return True
         except Exception as e:
             debug_print(f"File compression failed: {e}")
             return False
 
     def decompress_gz_file(self, gz_file, json_file):
-        """Decompress .gz file to JSON format"""
+        """Decrypt and decompress ClipSon CSGZ v1 container to JSON."""
         try:
-            with gzip.open(gz_file, 'rb') as f_in:
-                with open(json_file, 'wb') as f_out:
-                    while True:
-                        chunk = f_in.read(8192)
-                        if not chunk:
-                            break
-                        f_out.write(chunk)
+            try:
+                from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+                from cryptography.hazmat.primitives import padding
+            except Exception as e:
+                debug_print(f"Missing Python dependency 'cryptography' for decryption: {e}")
+                print("ERROR: Python package 'cryptography' is required for encrypted clipboard sync.")
+                print("Install it with: pip install -r requirements.txt")
+                return False
+
+            password = str(CONFIG_DATA.get('app', {}).get('encryption_password', '') or CONFIG.get('password', '') or '')
+            if not password or not str(password).strip():
+                debug_print("No Nextcloud password available for decryption")
+                return False
+
+            blob = Path(gz_file).read_bytes()
+            if len(blob) < (4 + 1 + 1 + 4 + 1 + 1 + 4 + 32):
+                raise ValueError("Encrypted file too small")
+
+            if blob[:4] != b'CSGZ':
+                raise ValueError("Invalid file header (expected CSGZ)")
+
+            # Parse fixed header
+            # magic(4) + version(1) + kdf(1) + iter(4) + saltLen(1) + ivLen(1)
+            version, kdf_id, iterations, salt_len, iv_len = struct.unpack('<BBIBB', blob[4:4+1+1+4+1+1])
+            if version != 1:
+                raise ValueError(f"Unsupported encrypted format version: {version}")
+
+            pos = 4 + (1 + 1 + 4 + 1 + 1)
+            salt = blob[pos:pos + salt_len]
+            pos += salt_len
+            iv = blob[pos:pos + iv_len]
+            pos += iv_len
+
+            remaining = len(blob) - pos
+            if remaining < 32:
+                raise ValueError("Encrypted file too small (missing HMAC)")
+
+            # Two accepted layouts after salt+iv:
+            #  A) legacy: u32 cipher_len + ciphertext + tag(32)
+            #  B) current: ciphertext + tag(32)
+            ciphertext = None
+            tag = None
+            if remaining >= (4 + 32):
+                candidate_len = struct.unpack('<I', blob[pos:pos + 4])[0]
+                candidate_end = pos + 4 + candidate_len
+                if candidate_len <= (remaining - 4 - 32) and (candidate_end + 32) == len(blob):
+                    # legacy layout A
+                    pos += 4
+                    ciphertext = blob[pos:pos + candidate_len]
+                    pos += candidate_len
+                    tag = blob[pos:]
+
+            if ciphertext is None:
+                # layout B
+                cipher_len = remaining - 32
+                ciphertext = blob[pos:pos + cipher_len]
+                tag = blob[pos + cipher_len:]
+
+            if len(tag) != 32:
+                raise ValueError(f"Invalid HMAC length (expected 32, got {len(tag)})")
+
+            hash_name = 'sha256' if kdf_id == 2 else 'sha1'
+            key_material = hashlib.pbkdf2_hmac(hash_name, password.encode('utf-8'), salt, int(iterations), dklen=64)
+            enc_key = key_material[:32]
+            mac_key = key_material[32:]
+
+            to_mac = blob[:-32]
+            expected = hmac.new(mac_key, to_mac, hashlib.sha256).digest()
+            if not hmac.compare_digest(expected, tag):
+                raise ValueError("HMAC verification failed (wrong password or corrupted file)")
+
+            decryptor = Cipher(algorithms.AES(enc_key), modes.CBC(iv)).decryptor()
+            padded = decryptor.update(ciphertext) + decryptor.finalize()
+            unpadder = padding.PKCS7(128).unpadder()
+            gzip_bytes = unpadder.update(padded) + unpadder.finalize()
+
+            plain = gzip.decompress(gzip_bytes)
+            with open(json_file, 'wb') as f_out:
+                f_out.write(plain)
             return True
         except Exception as e:
             debug_print(f"File decompression failed: {e}")
@@ -463,8 +586,8 @@ class ClipSon:
                 
                 if displayname_elem is not None and displayname_elem.text:
                     filename = displayname_elem.text
-                    # Now looking for .json.gz files
-                    if filename.startswith('clipboard-') and filename.endswith('.json.gz'):
+                    # Now looking for .cs files
+                    if filename.startswith('clipboard-') and filename.endswith('.cs'):
                         last_modified = None
                         if lastmodified_elem is not None and lastmodified_elem.text:
                             try:
@@ -493,19 +616,19 @@ class ClipSon:
         print("Discovering remote clipboard files...")
         remote_files = self.get_remote_clipboard_files()
         
-        # Filter out our own file (compressed json.gz now)
+        # Filter out our own file
         base = f"clipboard-{self.hostname}"
-        peer_files = [f for f in remote_files if f['name'] != f"{base}.json.gz"]
+        peer_files = [f for f in remote_files if f['name'] != f"{base}.cs"]
         
         debug_print(f"Total remote files found: {len(remote_files)}")
         debug_print(f"My hostname: {self.hostname}")
-        debug_print(f"My file: {base}.json.gz")
+        debug_print(f"My file: {base}.cs")
         debug_print(f"All remote files: {[f['name'] for f in remote_files]}")
         debug_print(f"Filtered peer files count: {len(peer_files)}")
         
         if not peer_files:
             print("No remote clipboard files from other machines found.")
-            print(f"Will only upload to: {base}.json.gz")
+            print(f"Will only upload to: {base}.cs")
             return []
         
         print(f"\nFound {len(peer_files)} remote peer(s):")
@@ -598,10 +721,10 @@ class ClipSon:
         # Get current list of remote files
         remote_files = self.get_remote_clipboard_files()
         base = f"clipboard-{self.hostname}"
-        # Only look for .json.gz files now
-        peer_files = [f for f in remote_files if f['name'] != f"{base}.json.gz" and f['name'].startswith('clipboard-') and f['name'].endswith('.json.gz')]
+        # Only look for .cs files now
+        peer_files = [f for f in remote_files if f['name'] != f"{base}.cs" and f['name'].startswith('clipboard-') and f['name'].endswith('.cs')]
         
-        debug_print(f"Remote check - Total files: {len(remote_files)}, My file: {base}.json.gz, Peer files: {len(peer_files)}")
+        debug_print(f"Remote check - Total files: {len(remote_files)}, My file: {base}.cs, Peer files: {len(peer_files)}")
         
         most_recent_content = None
         most_recent_timestamp = 0
@@ -633,8 +756,8 @@ class ClipSon:
                     print(f"{datetime.now().strftime('%H:%M:%S')} - Remote file updated: {filename}")
                 
                 # Download and decompress
-                temp_download_file_gz = f'./temp-remote-download-{filename.replace(".json.gz", "")}.json.gz'
-                temp_download_file_json = f'./temp-remote-download-{filename.replace(".json.gz", "")}.json'
+                temp_download_file_gz = f'./temp-remote-download-{filename.replace(".cs", "")}.cs'
+                temp_download_file_json = f'./temp-remote-download-{filename.replace(".cs", "")}.json'
                 
                 if self.download_remote_file(filename, temp_download_file_gz):
                     try:

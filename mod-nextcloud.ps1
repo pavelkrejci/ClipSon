@@ -364,7 +364,7 @@ function Get-RemoteClipboardFiles {
             $displayNameNode = $node.SelectSingleNode(".//D:displayname", $NamespaceManager)
             $lastModifiedNode = $node.SelectSingleNode(".//D:getlastmodified", $NamespaceManager)
             
-            if ($displayNameNode -and $displayNameNode.InnerText -match "^clipboard-.*\.json\.gz$") {
+                if ($displayNameNode -and $displayNameNode.InnerText -match "^clipboard-.*\.cs$") {
                 $lastModified = $null
                 if ($lastModifiedNode -and $lastModifiedNode.InnerText) {
                     try {
@@ -398,7 +398,7 @@ function Select-RemoteSyncFile {
     $remoteFiles = Get-RemoteClipboardFiles -Connection $Connection -RemoteFolder $RemoteFolder
     
     $hostname = $env:COMPUTERNAME
-    $myFile = "clipboard-$hostname.json.gz"
+    $myFile = "clipboard-$hostname.cs"
     
     $filteredFiles = @()
     foreach ($file in $remoteFiles) {
@@ -460,11 +460,11 @@ function Check-AllRemoteFilesForUpdates {
         
         $remoteFiles = Get-RemoteClipboardFiles -Connection $Connection -RemoteFolder $RemoteFolder
         $hostname = $env:COMPUTERNAME
-        $myFile = "clipboard-$hostname.json.gz"
+        $myFile = "clipboard-$hostname.cs"
         
         $peerFiles = @()
         foreach ($file in $remoteFiles) {
-            if ($file.Name -ne $myFile -and $file.Name -match "^clipboard-.*\.json\.gz$") {
+            if ($file.Name -ne $myFile -and $file.Name -match "^clipboard-.*\.cs$") {
                 $peerFiles += $file
             }
         }
@@ -497,8 +497,8 @@ function Check-AllRemoteFilesForUpdates {
                     Write-Host "$(Get-Date -Format 'HH:mm:ss') - Remote file updated: $filename" -ForegroundColor Cyan
                 }
                 
-                $tempDownloadFileGz = ".\temp-remote-download-$($filename.Replace('.json.gz', '')).json.gz"
-                $tempDownloadFileJson = ".\temp-remote-download-$($filename.Replace('.json.gz', '')).json"
+                $tempDownloadFileGz = ".\temp-remote-download-$($filename.Replace('.cs', '')).cs"
+                $tempDownloadFileJson = ".\temp-remote-download-$($filename.Replace('.cs', '')).json"
                 $remotePath = $RemoteFolder + $filename
                 
                 $downloadResult = Get-NextcloudFile -Connection $Connection -RemoteFilePath $remotePath -LocalFilePath $tempDownloadFileGz -IncludeTimestamp
