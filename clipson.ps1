@@ -71,8 +71,9 @@ if (-not (Test-NextcloudConnection -Connection $global:webdavConnection)) {
 # Local file paths - make them global so modules can access them
 $hostname = $env:COMPUTERNAME
 $global:localSyncFile = ".\clipboard-$hostname.json"
-$global:localSyncFile7z = ".\clipboard-$hostname.cpsn"
-$global:localUploadPath = $global:Config.nextcloud.remote_folder + "clipboard-$hostname.cpsn"
+$archiveExtension = Get-ArchiveExtension
+$global:localSyncFile7z = ".\clipboard-$hostname$archiveExtension"
+$global:localUploadPath = $global:Config.nextcloud.remote_folder + "clipboard-$hostname$archiveExtension"
 
 # Global variables
 $global:fileCounter = 0
@@ -338,4 +339,3 @@ finally {
     
     Write-Host "ClipSon stopped." -ForegroundColor Cyan
 }
-

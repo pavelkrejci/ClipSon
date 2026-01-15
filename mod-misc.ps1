@@ -18,6 +18,15 @@ function Get-Configuration {
     }
 }
 
+function Get-ArchiveExtension {
+    $use7z = $true
+    if ($global:Config -and $global:Config.app -and $global:Config.app.PSObject.Properties.Name -contains "use_7z_encryption") {
+        $use7z = [bool]$global:Config.app.use_7z_encryption
+    }
+
+    return $(if ($use7z) { ".cpsn" } else { ".gz" })
+}
+
 function Get-PasswordIfNeeded {
     param($NextcloudConfig)
     if ([string]::IsNullOrWhiteSpace($NextcloudConfig.Password)) {
@@ -159,7 +168,60 @@ function Strip-CpsnHeaderToFile {
     }
 }
 
+function Get-ArchiveFormat {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$Path
+    )
+
+    try {
+        if (-not (Test-Path $Path)) { return "unknown" }
+        $fs = [System.IO.File]::OpenRead($Path)
+        try {
+            $buf = New-Object byte[] 6
+            $read = $fs.Read($buf, 0, 6)
+            if ($read -ge 4) {
+                $sig = [System.Text.Encoding]::ASCII.GetString($buf, 0, [Math]::Min(4, $read))
+                if ($sig -eq "CPSN") { return "cpsn" }
+            }
+            if ($read -ge 2 -and $buf[0] -eq 0x1f -and $buf[1] -eq 0x8b) { return "gzip" }
+            if ($read -eq 6 -and $buf[0] -eq 0x37 -and $buf[1] -eq 0x7a -and $buf[2] -eq 0xbc -and $buf[3] -eq 0xaf -and $buf[4] -eq 0x27 -and $buf[5] -eq 0x1c) {
+                return "7z"
+            }
+            return "unknown"
+        }
+        finally {
+            $fs.Close()
+        }
+    }
+    catch {
+        return "unknown"
+    }
+}
+
 function Compress-JsonFile {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$JsonFile,
+        [Parameter(Mandatory=$true)]
+        [string]$GzFile
+    )
+
+    $use7z = $true
+    if ($global:Config -and $global:Config.app -and $global:Config.app.PSObject.Properties.Name -contains "use_7z_encryption") {
+        $use7z = [bool]$global:Config.app.use_7z_encryption
+    }
+
+    if ($use7z) {
+        $encOk = Compress-JsonFileWith7z -JsonFile $JsonFile -GzFile $GzFile
+        if ($encOk) { return $true }
+        Write-DebugMsg "7z compression failed or unavailable; falling back to gzip"
+    }
+
+    return Compress-JsonFileWithGzip -JsonFile $JsonFile -GzFile $GzFile
+}
+
+function Compress-JsonFileWith7z {
     param(
         [Parameter(Mandatory=$true)]
         [string]$JsonFile,
@@ -230,7 +292,100 @@ function Compress-JsonFile {
     }
 }
 
+function Compress-JsonFileWithGzip {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$JsonFile,
+        [Parameter(Mandatory=$true)]
+        [string]$GzFile
+    )
+    $tempPath = "$GzFile.$([System.Guid]::NewGuid().ToString('N')).tmp"
+    try {
+        if (Test-Path $tempPath) {
+            Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
+        }
+
+        $input = [System.IO.File]::OpenRead($JsonFile)
+        try {
+            $output = [System.IO.File]::Create($tempPath)
+            try {
+                $gzip = New-Object System.IO.Compression.GzipStream($output, [System.IO.Compression.CompressionLevel]::Optimal, $true)
+                try {
+                    $input.CopyTo($gzip)
+                }
+                finally {
+                    $gzip.Dispose()
+                }
+            }
+            finally {
+                $output.Dispose()
+            }
+        }
+        finally {
+            $input.Dispose()
+        }
+
+        Move-Item -LiteralPath $tempPath -Destination $GzFile -Force
+
+        if ($global:Config -and $global:Config.app.debug_enabled) {
+            $originalSize = (Get-Item $JsonFile).Length
+            $compressedSize = (Get-Item $GzFile).Length
+            $ratio = if ($originalSize -gt 0) { (1 - $compressedSize / $originalSize) * 100 } else { 0 }
+            Write-DebugMsg "Gzip compression $originalSize -> $compressedSize bytes ($([Math]::Round($ratio, 1))% smaller)"
+        }
+
+        return $true
+    }
+    catch {
+        Write-DebugMsg "Gzip compression failed: $($_.Exception.Message)"
+        return $false
+    }
+    finally {
+        if (Test-Path $tempPath) {
+            Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 function Decompress-GzFile {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$GzFile,
+        [Parameter(Mandatory=$true)]
+        [string]$JsonFile
+    )
+
+    $use7z = $true
+    if ($global:Config -and $global:Config.app -and $global:Config.app.PSObject.Properties.Name -contains "use_7z_encryption") {
+        $use7z = [bool]$global:Config.app.use_7z_encryption
+    }
+
+    $format = Get-ArchiveFormat -Path $GzFile
+    $preferred = switch ($format) {
+        "cpsn" { "7z" }
+        "7z" { "7z" }
+        "gzip" { "gzip" }
+        default { if ($use7z) { "7z" } else { "gzip" } }
+    }
+
+    $methods = @($preferred, $(if ($preferred -eq "7z") { "gzip" } else { "7z" }))
+
+    foreach ($method in $methods) {
+        if ($method -eq "7z") {
+            if (Decompress-JsonWith7z -GzFile $GzFile -JsonFile $JsonFile) {
+                return $true
+            }
+        } else {
+            if (Decompress-GzipFile -GzFile $GzFile -JsonFile $JsonFile) {
+                return $true
+            }
+        }
+    }
+
+    return $false
+}
+
+function Decompress-JsonWith7z {
     param(
         [Parameter(Mandatory=$true)]
         [string]$GzFile,
@@ -248,7 +403,6 @@ function Decompress-GzFile {
         New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
 
         try {
-            # If the archive is CPSN-prefixed, strip it to a real 7z file before extraction.
             $archiveToExtract = $GzFile
             $strippedArchive = Join-Path $tempDir "archive.7z"
             Strip-CpsnHeaderToFile -InputPath $GzFile -OutputPath $strippedArchive
@@ -275,7 +429,6 @@ function Decompress-GzFile {
 
             $payload = Join-Path $tempDir "payload.json"
             if (-not (Test-Path $payload)) {
-                # Fallback: pick first extracted file
                 $first = Get-ChildItem -Path $tempDir -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
                 if (-not $first) {
                     Write-DebugMsg "7z decryption produced no files"
@@ -294,6 +447,41 @@ function Decompress-GzFile {
     }
     catch {
         Write-DebugMsg "File decryption failed: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Decompress-GzipFile {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$GzFile,
+        [Parameter(Mandatory=$true)]
+        [string]$JsonFile
+    )
+    try {
+        $input = [System.IO.File]::OpenRead($GzFile)
+        try {
+            $gzip = New-Object System.IO.Compression.GzipStream($input, [System.IO.Compression.CompressionMode]::Decompress)
+            try {
+                $outStream = [System.IO.File]::Create($JsonFile)
+                try {
+                    $gzip.CopyTo($outStream)
+                }
+                finally {
+                    $outStream.Dispose()
+                }
+            }
+            finally {
+                $gzip.Dispose()
+            }
+        }
+        finally {
+            $input.Dispose()
+        }
+        return $true
+    }
+    catch {
+        Write-DebugMsg "Gzip decompression failed: $($_.Exception.Message)"
         return $false
     }
 }

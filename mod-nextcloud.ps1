@@ -416,7 +416,7 @@ function Get-RemoteClipboardFiles {
             $displayNameNode = $node.SelectSingleNode(".//D:displayname", $NamespaceManager)
             $lastModifiedNode = $node.SelectSingleNode(".//D:getlastmodified", $NamespaceManager)
             
-            if ($displayNameNode -and $displayNameNode.InnerText -match "^clipboard-.*\.cpsn$") {
+            if ($displayNameNode -and $displayNameNode.InnerText -match "^clipboard-.*\.(cpsn|gz)$") {
                 $lastModified = $null
                 if ($lastModifiedNode -and $lastModifiedNode.InnerText) {
                     try {
@@ -450,11 +450,12 @@ function Select-RemoteSyncFile {
     $remoteFiles = Get-RemoteClipboardFiles -Connection $Connection -RemoteFolder $RemoteFolder
     
     $hostname = $env:COMPUTERNAME
-    $myFile = "clipboard-$hostname.cpsn"
+    $archiveExtension = Get-ArchiveExtension
+    $myFiles = @("clipboard-$hostname.cpsn", "clipboard-$hostname.gz")
     
     $filteredFiles = @()
     foreach ($file in $remoteFiles) {
-        if ($file.Name -ne $myFile) {
+        if ($myFiles -notcontains $file.Name) {
             $filteredFiles += $file
         }
     }
@@ -462,13 +463,13 @@ function Select-RemoteSyncFile {
     if ($global:Config.app.debug_enabled) {
         Write-DebugMsg "Total remote files found: $($remoteFiles.Count)"
         Write-DebugMsg "My hostname: $hostname"
-        Write-DebugMsg "My file: $myFile"
+        Write-DebugMsg "My files: $($myFiles -join ', ')"
         Write-DebugMsg "Files after filtering out my file: $($filteredFiles.Count)"
     }
     
     if ($filteredFiles.Count -eq 0) {
         Write-Host "No remote clipboard files from other machines found." -ForegroundColor Yellow
-        Write-Host "Will only upload to: $myFile" -ForegroundColor Green
+        Write-Host "Will only upload to: clipboard-$hostname$archiveExtension" -ForegroundColor Green
         return @()
     }
     
@@ -512,11 +513,11 @@ function Check-AllRemoteFilesForUpdates {
         
         $remoteFiles = Get-RemoteClipboardFiles -Connection $Connection -RemoteFolder $RemoteFolder
         $hostname = $env:COMPUTERNAME
-        $myFile = "clipboard-$hostname.cpsn"
+        $myFiles = @("clipboard-$hostname.cpsn", "clipboard-$hostname.gz")
         
         $peerFiles = @()
         foreach ($file in $remoteFiles) {
-            if ($file.Name -ne $myFile -and $file.Name -match "^clipboard-.*\.cpsn$") {
+            if ($myFiles -notcontains $file.Name -and $file.Name -match "^clipboard-.*\.(cpsn|gz)$") {
                 $peerFiles += $file
             }
         }
@@ -549,8 +550,8 @@ function Check-AllRemoteFilesForUpdates {
                     Write-Host "$(Get-Date -Format 'HH:mm:ss') - Remote file updated: $filename" -ForegroundColor Cyan
                 }
                 
-                $tempDownloadFileGz = ".\temp-remote-download-$($filename.Replace('.cpsn', '')).cpsn"
-                $tempDownloadFileJson = ".\temp-remote-download-$($filename.Replace('.cpsn', '')).json"
+                $tempDownloadFileGz = ".\temp-remote-download-$filename"
+                $tempDownloadFileJson = [System.IO.Path]::ChangeExtension($tempDownloadFileGz, ".json")
                 $remotePath = $RemoteFolder + $filename
                 
                 $downloadResult = Get-NextcloudFile -Connection $Connection -RemoteFilePath $remotePath -LocalFilePath $tempDownloadFileGz -IncludeTimestamp

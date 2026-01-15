@@ -310,6 +310,7 @@ function Get-MimeType {
             '.zip' = 'application/zip'
             '.rar' = 'application/x-rar-compressed'
             '.cpsn' = 'application/octet-stream'
+            '.gz' = 'application/gzip'
             '.exe' = 'application/x-msdownload'
             '.msi' = 'application/x-msi'
         }
@@ -814,6 +815,5 @@ function Set-ClipboardRichContent {
         return $false
     }
 }
-
 
 
