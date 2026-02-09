@@ -552,6 +552,10 @@ function Check-AllRemoteFilesForUpdates {
                 
                 $tempDownloadFileGz = ".\temp-remote-download-$filename"
                 $tempDownloadFileJson = [System.IO.Path]::ChangeExtension($tempDownloadFileGz, ".json")
+                if ($global:tempFilesToCleanup) {
+                    $global:tempFilesToCleanup += $tempDownloadFileGz
+                    $global:tempFilesToCleanup += $tempDownloadFileJson
+                }
                 $remotePath = $RemoteFolder + $filename
                 
                 $downloadResult = Get-NextcloudFile -Connection $Connection -RemoteFilePath $remotePath -LocalFilePath $tempDownloadFileGz -IncludeTimestamp

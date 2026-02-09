@@ -40,14 +40,9 @@ catch {
 $global:EnableDebugMessages = $global:Config.app.debug_enabled
 $global:skipClipboardCheckUntil = [DateTime]::MinValue
 $global:exitLoop = $false
+$global:tempFilesToCleanup = @()
 
-# Output directory - make it global so it's accessible in event handlers
-$global:outputDir = ".\captures-$($env:COMPUTERNAME)"
-$global:maxEntries = 100  # Add maximum entries configuration
 
-if (!(Test-Path $global:outputDir)) {
-    New-Item -ItemType Directory -Path $global:outputDir | Out-Null
-}
 
 # Get password if needed
 Get-PasswordIfNeeded -NextcloudConfig $global:Config.nextcloud
@@ -107,16 +102,8 @@ $handler = {
                 
                 Write-DebugMsg "Processing clipboard image"
                 
-                # Proceed with saving and uploading
-                $fileNumber = Get-NextFileNumber
-                $paddedNumber = $fileNumber.ToString().PadLeft(3, '0')
-                $filename = "$outputDir\clipboard_image_$paddedNumber.png"
-                
-                Write-DebugMsg "Creating image file: $filename"
-                
-                # Save the image bytes to file
-                [System.IO.File]::WriteAllBytes($filename, $imageBytes)
-                Write-Host "$(Get-Date -Format 'HH:mm:ss.fff') - Image saved: $filename"
+                # Proceed with upload (no local capture files)
+                Write-DebugMsg "Uploading clipboard image (no local capture file)"
                 
                 # Create unified JSON format for image
                 $imageB64 = [System.Convert]::ToBase64String($imageBytes)
@@ -132,7 +119,7 @@ $handler = {
                 Upload-ToWebDAV -Content $uploadJson -Connection $global:webdavConnection -LocalSyncFile $localSyncFile -LocalSyncFile7z $localSyncFile7z -RemoteFilePath $localUploadPath
                 
                 # Show notification for image capture
-                Show-ClipboardNotification -Title "ClipSon" -Message "Image captured: $filename" -Icon "Info"
+                Show-ClipboardNotification -Title "ClipSon" -Message "Image captured" -Icon "Info"
                 
                 $image.Dispose()
             }
@@ -195,35 +182,8 @@ $handler = {
             # Process if content is not empty
             if ($currentContent.Trim() -ne "") {
                 
-                $fileNumber = Get-NextFileNumber
-                $paddedNumber = $fileNumber.ToString().PadLeft(3, '0')
-                $filename = Join-Path $outputDir "clipboard_text_$paddedNumber.txt"
-                
-                # Verify the filename is correct before writing
-                if ($filename -notmatch "clipboard_text_\d{3}\.txt$") {
-                    Write-Error "$(Get-Date -Format 'HH:mm:ss.fff') - ERROR: Invalid filename generated: '$filename'"
-                    return
-                }
-                
-                Write-DebugMsg "About to write content (length: $($currentContent.Length)) to file: '$filename'"
-                
-                # Save to numbered file
-                try {
-                    [System.IO.File]::WriteAllText($filename, $currentContent, [System.Text.Encoding]::UTF8)
-                    Write-Host "$(Get-Date -Format 'HH:mm:ss.fff') - Text saved: $filename"
-                    
-                    # Verify file was created correctly
-                    if (Test-Path $filename) {
-                        $fileSize = (Get-Item $filename).Length
-                        Write-DebugMsg "File created successfully, size: $fileSize bytes"
-                    } else {
-                        Write-Error "$(Get-Date -Format 'HH:mm:ss.fff') - ERROR: File was not created: '$filename'"
-                    }
-                } catch {
-                    Write-Error "$(Get-Date -Format 'HH:mm:ss.fff') - ERROR: Failed to write file '$filename': $($_.Exception.Message)"
-                    return
-                }
-                
+                Write-DebugMsg "Uploading clipboard text (no local capture file)"
+
                 # Create JSON format for upload
                 $uploadContent = @{
                     type = "PLAIN_TEXT"
@@ -335,6 +295,18 @@ finally {
     # Dispose the monitor object last
     if ($monitor) {
         $monitor.Dispose()
+    }
+
+    # Clean up any remaining temp files
+    if ($global:tempFilesToCleanup -and $global:tempFilesToCleanup.Count -gt 0) {
+        foreach ($tempFile in $global:tempFilesToCleanup) {
+            try {
+                if (Test-Path $tempFile) {
+                    Remove-Item $tempFile -ErrorAction SilentlyContinue
+                }
+            }
+            catch { }
+        }
     }
     
     Write-Host "ClipSon stopped." -ForegroundColor Cyan

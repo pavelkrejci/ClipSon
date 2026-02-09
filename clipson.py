@@ -27,6 +27,7 @@ import tempfile
 import shutil
 import uuid
 import gzip
+import atexit
 
 CPSN_MAGIC = b'CPSN'
 
@@ -85,9 +86,6 @@ class ClipSon:
         get_password_if_needed()
         
         self.hostname = os.uname().nodename
-        self.output_dir = Path(f'./captures-{self.hostname}')
-        self.output_dir.mkdir(exist_ok=True)
-
         self.use_7z_encryption = CONFIG_DATA['app'].get('use_7z_encryption', True)
         self.archive_extension = '.cpsn' if self.use_7z_encryption else '.gz'
         self.my_sync_filenames = {
@@ -111,6 +109,10 @@ class ClipSon:
         self.local_sync_file = Path(f'./clipboard-{self.hostname}.json')
         self.local_sync_file_archive = Path(f'./clipboard-{self.hostname}{self.archive_extension}')
         self.local_upload_file = f"clipboard-{self.hostname}{self.archive_extension}"
+
+        # Temporary directory for restored files (cleaned up on exit)
+        self.restored_temp_dir = Path(tempfile.mkdtemp(prefix=f"clipson-restored-{self.hostname}-"))
+        atexit.register(self._cleanup_restored_temp_dir)
         
         # Setup signal handler
         signal.signal(signal.SIGINT, self.signal_handler)
@@ -131,8 +133,27 @@ class ClipSon:
             print(f"Using xclip for clipboard operations.")
 
     def signal_handler(self, signum, frame):
+        self._cleanup_restored_temp_dir()
         print("\nClipSon stopped.")
         sys.exit(0)
+
+    def _cleanup_restored_temp_dir(self):
+        try:
+            if self.restored_temp_dir and self.restored_temp_dir.exists():
+                shutil.rmtree(self.restored_temp_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+    def _clear_restored_temp_dir(self):
+        try:
+            if self.restored_temp_dir and self.restored_temp_dir.exists():
+                for item in self.restored_temp_dir.iterdir():
+                    if item.is_dir():
+                        shutil.rmtree(item, ignore_errors=True)
+                    else:
+                        item.unlink(missing_ok=True)
+        except Exception:
+            pass
     
     def check_dependencies(self):
         """Check if required system dependencies are available"""
@@ -228,9 +249,7 @@ class ClipSon:
             if not file_uris:
                 return False
 
-            file_number = self.get_next_file_number()
             files_data = {}
-            saved_files = []
 
             for file_path in file_uris:
                 try:
@@ -271,12 +290,6 @@ class ClipSon:
                         "mime_type": self.get_mime_type(file_path)
                     }
                     
-                    # Save file locally for reference
-                    local_file = self.output_dir / f"clipboard_file_{file_number:03d}_{file_name}"
-                    with open(local_file, 'wb') as f:
-                        f.write(file_content)
-                    saved_files.append(local_file)
-                    
                     debug_print(f"Processed file: {file_name} ({file_size} bytes)")
                     
                 except Exception as e:
@@ -284,7 +297,7 @@ class ClipSon:
                     continue
 
             if files_data:
-                print(f"{datetime.now().strftime('%H:%M:%S')} - File(s) saved: {len(files_data)} file(s)")
+                print(f"{datetime.now().strftime('%H:%M:%S')} - File(s) captured: {len(files_data)} file(s)")
                 for filename in files_data.keys():
                     print(f"  - {filename}")
                 
@@ -582,14 +595,8 @@ class ClipSon:
                     debug_print(f"Image hash matches previous - skipping save and upload")
                     return False
                 
-                # Hash is different, proceed with saving
-                file_number = self.get_next_file_number()
-                filename = self.output_dir / f"clipboard_image_{file_number:03d}.png"
-                
-                with open(filename, 'wb') as f:
-                    f.write(result.stdout)
-                
-                print(f"{datetime.now().strftime('%H:%M:%S')} - Image saved: {filename}")
+                # Hash is different, proceed with upload (no local capture file)
+                print(f"{datetime.now().strftime('%H:%M:%S')} - Image captured")
                 
                 # Update hash tracking
                 self.last_image_hash = current_image_hash
@@ -618,7 +625,7 @@ class ClipSon:
                             print(f"{datetime.now().strftime('%H:%M:%S')} - Uploaded encrypted image to WebDAV: {self.local_upload_file}")
                 
                 # Show notification
-                self.show_notification("ClipSon", f"Image captured: {filename}")
+                self.show_notification("ClipSon", "Image captured")
                 
                 return True
         except Exception as e:
@@ -910,15 +917,8 @@ class ClipSon:
         return self.file_counter
     
     def save_clipboard_text(self, content):
-        """Save clipboard text to numbered file and upload"""
-        # Save to numbered file
-        file_number = self.get_next_file_number()
-        filename = self.output_dir / f"clipboard_text_{file_number:03d}.txt"
-        
-        with open(filename, 'w', encoding='utf-8') as f:
-            f.write(content)
-        
-        print(f"{datetime.now().strftime('%H:%M:%S')} - Text saved: {filename}")
+        """Save clipboard text and upload"""
+        print(f"{datetime.now().strftime('%H:%M:%S')} - Text captured")
         
         # Skip sync on first clipboard capture after app start
         if self.first_clipboard_capture:
@@ -1017,16 +1017,12 @@ class ClipSon:
         return False
 
     def save_clipboard_rich_content(self):
-        """Save all available clipboard formats to files"""
+        """Save all available clipboard formats to JSON and upload"""
         try:
             formats = self.get_clipboard_formats()
             if not formats:
                 return False
 
-            file_number = self.get_next_file_number()
-            base_filename = self.output_dir / f"clipboard_rich_{file_number:03d}"
-
-            saved_files = []
             format_data = {}  # Store all format data for multi-format upload
             seen_content = set()  # Track content to avoid duplicates
 
@@ -1059,24 +1055,15 @@ class ClipSon:
                                 continue
                             
                             seen_content.add(content)
-                            filename = f"{base_filename}{extension}"
-                            
-                            with open(filename, 'w', encoding='utf-8') as f:
-                                f.write(content)
-                            
-                            saved_files.append(filename)
                             format_data[format_name] = content
-                            
-                            debug_print(f"Saved {format_name} to {filename}")
+                            debug_print(f"Captured {format_name} content")
                                 
                     except Exception as e:
                         debug_print(f"Failed to save format {format_name}: {e}")
                         continue
 
-            if saved_files and format_data:
-                print(f"{datetime.now().strftime('%H:%M:%S')} - Rich content saved: {len(saved_files)} unique formats")
-                for filename in saved_files:
-                    print(f"  - {filename}")
+            if format_data:
+                print(f"{datetime.now().strftime('%H:%M:%S')} - Rich content captured: {len(format_data)} unique formats")
                 
                 # Skip sync on first clipboard capture after app start
                 if self.first_clipboard_capture:
@@ -1098,8 +1085,7 @@ class ClipSon:
                         self.upload_to_webdav(self.local_sync_file_archive, self.local_upload_file)
                 
                 # Show notification with unique format types
-                unique_extensions = list(set([ext for filename in saved_files for ext in [Path(filename).suffix]]))
-                format_list = ', '.join(unique_extensions[:3])
+                format_list = ', '.join(list(format_data.keys())[:3])
                 self.show_notification("ClipSon", f"Rich content captured: {format_list}")
                 
                 return True
@@ -1171,9 +1157,8 @@ class ClipSon:
     def set_clipboard_files(self, files_data):
         """Set clipboard with file URIs and restore files to temp location"""
         try:
-            # Create temporary directory for restored files
-            temp_dir = Path(f'./temp-restored-files-{self.hostname}')
-            temp_dir.mkdir(exist_ok=True)
+            # Clear temporary directory for restored files
+            self._clear_restored_temp_dir()
             
             restored_files = []
             uri_list = []
@@ -1185,7 +1170,7 @@ class ClipSon:
                     
                     # Create safe filename
                     safe_filename = self.sanitize_filename(filename)
-                    temp_file_path = temp_dir / safe_filename
+                    temp_file_path = self.restored_temp_dir / safe_filename
                     
                     # Write file to temp location
                     with open(temp_file_path, 'wb') as f:
@@ -1462,7 +1447,6 @@ class ClipSon:
         peer_files = self.discover_remote_peers()
         
         print("ClipSon started. Press Ctrl+C to stop.")
-        print(f"Captured content will be saved to: {self.output_dir}")
         print(f"Maximum entries: {self.max_history} (older files will be automatically deleted)")
         print(f"Local sync file: {self.local_sync_file}")
         print(f"Local upload file (upload): {self.local_upload_file}")
@@ -1471,7 +1455,7 @@ class ClipSon:
             print(f"  - {peer_file}")
         print(f"Remote check interval: {self.remote_check_interval} seconds")
         print("Supported formats: Multi-format Text, Images (unified JSON), HTML, RTF, URLs, Files")
-        print("Note: First clipboard capture after startup will be saved locally but not synced.")
+        print("Note: First clipboard capture after startup will not be synced.")
         
         while True:
             try:

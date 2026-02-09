@@ -181,9 +181,7 @@ function global:Save-ClipboardFiles {
         
         Write-DebugMsg "Processing $($fileList.Count) clipboard files"
         
-        $fileNumber = Get-NextFileNumber
         $filesData = @{}
-        $savedFiles = @()
         $maxFileSize = $global:Config.app.max_file_copy_size_mb * 1024 * 1024
         
         foreach ($filePath in $fileList) {
@@ -224,12 +222,6 @@ function global:Save-ClipboardFiles {
                     mime_type = $mimeType
                 }
                 
-                # Save file locally for reference
-                $paddedNumber = $fileNumber.ToString().PadLeft(3, '0')
-                $localFile = Join-Path $global:outputDir "clipboard_file_${paddedNumber}_$fileName"
-                Copy-Item $filePath $localFile
-                $savedFiles += $localFile
-                
                 Write-DebugMsg "Processed file: $fileName ($($fileInfo.Length) bytes)"
             }
             catch {
@@ -239,7 +231,7 @@ function global:Save-ClipboardFiles {
         }
         
         if ($filesData.Count -gt 0) {
-            Write-Host "$(Get-Date -Format 'HH:mm:ss.fff') - File(s) saved: $($filesData.Count) file(s)"
+            Write-Host "$(Get-Date -Format 'HH:mm:ss.fff') - File(s) captured: $($filesData.Count) file(s)"
             foreach ($fileName in $filesData.Keys) {
                 Write-Host "  - $fileName"
             }
@@ -663,10 +655,6 @@ function global:Save-ClipboardRichContentJson {
         
         Write-DebugMsg "Available clipboard formats: $($FormatData.Keys -join ', ')"
         
-        $fileNumber = Get-NextFileNumber
-        $baseFilename = "$outputDir\clipboard_rich_$($fileNumber.ToString().PadLeft(3, '0'))"
-        
-        $savedFiles = @()
         # Build a new hashtable for processed content
         $formatDataForJson = @{}
         
@@ -683,27 +671,12 @@ function global:Save-ClipboardRichContentJson {
                     Write-DebugMsg "Stripped clipboard HTML header, using only HTML fragment."
                 }
             }
-            $extension = switch ($format) {
-                'text/html' { '.html' }
-                'text/rtf' { '.rtf' }
-                'text/plain' { '.txt' }
-                default { '.txt' }
-            }
-            
-            $filename = "$baseFilename$extension"
-            [System.IO.File]::WriteAllText($filename, $content, $utf8NoBom)
-            $savedFiles += $filename
-            Write-DebugMsg "Saved $format to $filename"
             # Add processed content to new hashtable
             $formatDataForJson[$format] = $content
         }
         
-        if ($savedFiles.Count -gt 0) {
-            Write-Host "$(Get-Date -Format 'HH:mm:ss.fff') - Rich content saved: $($savedFiles.Count) unique formats"
-            foreach ($file in $savedFiles) {
-                Write-Host "  - $file"
-            }
-            
+        if ($formatDataForJson.Count -gt 0) {
+            Write-Host "$(Get-Date -Format 'HH:mm:ss.fff') - Rich content captured: $($formatDataForJson.Count) unique formats"
             # Create multi-format upload content with proper JSON escaping
             $uploadContent = @{
                 type = "MULTI_FORMAT_CLIPBOARD"
