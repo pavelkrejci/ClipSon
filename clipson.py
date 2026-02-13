@@ -171,10 +171,19 @@ class ClipSon:
     def show_notification(self, title, message, icon='info'):
         """Show desktop notification"""
         try:
-            subprocess.run([
-                'notify-send', title, message,
-                f'--icon={icon}', '--expire-time=3000'
-            ], check=False)
+            # Avoid blocking on DBus/notify-send hangs; fire-and-forget.
+            process = subprocess.Popen(
+                [
+                    'notify-send', title, message,
+                    f'--icon={icon}', '--expire-time=3000'
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            try:
+                process.communicate(timeout=1)
+            except subprocess.TimeoutExpired:
+                process.kill()
         except Exception:
             print(f"NOTIFICATION: {title} - {message}")
     
@@ -813,6 +822,11 @@ class ClipSon:
         # Get current list of remote files
         remote_files = self.get_remote_clipboard_files()
         base = f"clipboard-{self.hostname}"
+        my_remote_files = sorted(
+            f["name"]
+            for f in remote_files
+            if f["name"] in self.my_sync_filenames
+        )
         peer_files = [
             f for f in remote_files
             if f['name'] not in self.my_sync_filenames
@@ -820,7 +834,11 @@ class ClipSon:
             and (f['name'].endswith('.cpsn') or f['name'].endswith('.gz'))
         ]
         
-        debug_print(f"Remote check - Total files: {len(remote_files)}, My files: {sorted(self.my_sync_filenames)}, Peer files: {len(peer_files)}")
+        debug_print(f"Remote check - Total files: {len(remote_files)}, My files: {my_remote_files}")
+        for file_info in peer_files:
+            filename = file_info['name']
+            timestamp = file_info['last_modified'].strftime('%Y-%m-%d %H:%M:%S') if file_info['last_modified'] else 'Unknown'
+            debug_print(f"Peer file: {filename}, Modified: {timestamp}")
         
         most_recent_content = None
         most_recent_timestamp = 0
@@ -1100,33 +1118,61 @@ class ClipSon:
         try:
             if self.use_copyq:
                 debug_print(f"Setting {len(format_data)} clipboard formats (multi-mime) with copyq")
-                # ...existing copyq logic...
-                args = ['copyq', 'copy', '--']  # Add -- to prevent escape sequence expansion
+                
                 set_priority = [
                     'text/plain', 'text/html', 'text/rtf', 'application/rtf', 'application/x-rtf',
                     'text/richtext', 'text/uri-list', 'text/x-moz-url'                    
                 ]
-                used = set()
-                for format_name in set_priority:
-                    if format_name in format_data and format_name not in used:
-                        args.append(format_name)
-                        args.append(format_data[format_name])
-                        used.add(format_name)
-                total_args_length = sum(len(str(arg)) for arg in args)
-                if total_args_length > 2 * 1024 * 1024:
-                    debug_print(f"Total arguments length ({total_args_length} bytes) exceeds 2MB limit, falling back to text/plain only")
-                    if 'text/plain' in format_data:
-                        return self.set_clipboard_content(format_data['text/plain'])
+                
+                # Use temp files to avoid command-line payload limits
+                with tempfile.TemporaryDirectory(prefix='clipson-formats-') as tmpdir:
+                    tmpdir_path = Path(tmpdir)
+                    first_format = None
+                    used = set()
+                    
+                    for format_name in set_priority:
+                        if format_name in format_data and format_name not in used:
+                            used.add(format_name)
+                            content = format_data[format_name]
+                            
+                            # Write content to temp file
+                            temp_file = tmpdir_path / f"format_{len(used)}.txt"
+                            with open(temp_file, 'w', encoding='utf-8') as f:
+                                f.write(content)
+                            
+                            # First format: use 'write', subsequent formats: use 'change'
+                            if first_format is None:
+                                # copyq write 0 text/plain - < file
+                                cmd = ['copyq', 'write', '0', format_name, '-']
+                                debug_print(f"Writing first format {format_name}")
+                                with open(temp_file, 'rb') as f:
+                                    result = subprocess.run(cmd, stdin=f, check=True)
+                                if result.returncode != 0:
+                                    debug_print(f"Failed to write format {format_name}")
+                                    return False
+                                first_format = format_name
+                            else:
+                                # copyq change 0 text/html - < file
+                                cmd = ['copyq', 'change', '0', format_name, '-']
+                                debug_print(f"Adding format {format_name}")
+                                with open(temp_file, 'rb') as f:
+                                    result = subprocess.run(cmd, stdin=f, check=True)
+                                if result.returncode != 0:
+                                    debug_print(f"Failed to change format {format_name}")
+                                    return False
+                    
+                    if first_format:
+                        # Select the clipboard item to activate it
+                        result = subprocess.run(['copyq', 'select', '0'], check=True)
+                        if result.returncode == 0:
+                            debug_print(f"Successfully set {len(used)} formats with copyq (file-based)")
+                            return True
+                        else:
+                            debug_print("Failed to select clipboard item")
+                            return False
                     else:
-                        first_format = next(iter(format_data.values()))
-                        return self.set_clipboard_content(first_format)
-                result = subprocess.run(args, check=True)
-                if result.returncode == 0:
-                    debug_print("Successfully set multiple formats with copyq")
-                    return True
-                else:
-                    debug_print("copyq returned non-zero exit code")
-                    return False
+                        debug_print("No formats to set")
+                        return False
             else:
                 # xclip: only supports one format at a time, prefer text/html > text/rtf > text/plain
                 debug_print(f"Setting clipboard formats with xclip (no multi-mime support)")
