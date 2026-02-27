@@ -6,6 +6,7 @@ sudo apt update
 sudo apt install -y python3 python3-pip xclip libnotify-bin
 
 echo "Installing Python dependencies..."
-pip3 install -r requirements.txt
+sudo apt install -y python3-requests
+#pip3 install -r requirements.txt
 
 echo "Setup complete! Run with: python3 clipson.py"
