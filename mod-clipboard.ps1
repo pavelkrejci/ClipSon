@@ -1,6 +1,50 @@
 # Module for local clipboard handling functions
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
+# Helper functions for PowerShell 5.1 compatibility (doesn't support -Depth parameter)
+function ConvertFromJsonCompat {
+    param([string]$InputObject)
+    
+    try {
+        # Try with -Depth for PS 6.0+
+        return ConvertFrom-Json $InputObject -Depth 10
+    }
+    catch {
+        # Fall back to without -Depth for PS 5.1
+        if ($_.Exception.Message -match "parameter name 'Depth'") {
+            return ConvertFrom-Json $InputObject
+        }
+        throw
+    }
+}
+
+function ConvertToJsonCompat {
+    param(
+        [PSObject]$InputObject,
+        [switch]$Compress
+    )
+    
+    try {
+        # Try with -Depth for PS 6.0+
+        if ($Compress) {
+            return ConvertTo-Json $InputObject -Depth 10 -Compress
+        } else {
+            return ConvertTo-Json $InputObject -Depth 10
+        }
+    }
+    catch {
+        # Fall back to without -Depth for PS 5.1
+        if ($_.Exception.Message -match "parameter name 'Depth'") {
+            if ($Compress) {
+                return ConvertTo-Json $InputObject -Compress
+            } else {
+                return ConvertTo-Json $InputObject
+            }
+        }
+        throw
+    }
+}
+
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -241,7 +285,7 @@ function global:Save-ClipboardFiles {
                 type = "CLIPBOARD_FILES"
                 files = $filesData
             }
-            $uploadJson = ConvertTo-Json $uploadContent -Depth 10
+            $uploadJson = ConvertToJsonCompat $uploadContent
             
             # Upload to WebDAV
             Upload-ToWebDAV -Content $uploadJson -Connection $global:webdavConnection -LocalSyncFile $global:localSyncFile -LocalSyncFile7z $global:localSyncFile7z -RemoteFilePath $global:localUploadPath
@@ -322,10 +366,17 @@ function global:Set-ClipboardContentUnified {
     param([string]$Content)
     
     try {
+        # Remove BOM if present FIRST, before any checks
+        $contentText = $Content
+        if ($contentText.Length -gt 0 -and [int][char]$contentText[0] -eq 0xFEFF) {
+            $contentText = $contentText.TrimStart([char]0xFEFF)
+        }
+        
         # Check if this is JSON content
-        if ($Content.Trim().StartsWith('{')) {
+        if ($contentText.Trim().StartsWith('{')) {
             try {
-                $data = ConvertFrom-Json $Content
+                # Try with -Depth parameter (PowerShell 6.0+), fall back for 5.1
+                $data = ConvertFromJsonCompat $contentText
                 $contentType = $data.type
                 
                 if ($contentType -eq "CLIPBOARD_IMAGE") {
@@ -345,6 +396,11 @@ function global:Set-ClipboardContentUnified {
                         [System.Windows.Forms.Clipboard]::SetText($data.content)
                         return $true
                     }
+                    else {
+                        # Empty content in PLAIN_TEXT - still return success
+                        Write-DebugMsg "PLAIN_TEXT content is empty"
+                        return $true
+                    }
                 }
                 elseif ($contentType -eq "CLIPBOARD_FILES") {
                     # Handle file content
@@ -352,9 +408,14 @@ function global:Set-ClipboardContentUnified {
                         return Set-ClipboardFiles -FilesData $data.files
                     }
                 }
+                else {
+                    # Unknown content type - log and continue
+                    Write-DebugMsg "Unknown content type in JSON: $contentType"
+                }
             }
             catch {
-                # JSON parse failed, fall back to legacy handling
+                # JSON parse failed, log and fall back to legacy handling
+                Write-DebugMsg "JSON parsing failed: $($_.Exception.Message)"
             }
         }
         
@@ -580,7 +641,7 @@ function Update-LastClipboardContentFromRemote {
     try {
         if ($Content.Trim().StartsWith('{')) {
             try {
-                $data = ConvertFrom-Json $Content
+                $data = ConvertFromJsonCompat $Content
                 $contentType = $data.type
                 
                 if ($contentType -eq "CLIPBOARD_IMAGE") {
@@ -683,8 +744,8 @@ function global:Save-ClipboardRichContentJson {
                 formats = $formatDataForJson
             }
             
-            # Use ConvertTo-Json with proper depth and ensure ASCII escaping for special characters
-            $uploadJson = ConvertTo-Json $uploadContent -Depth 10 -Compress:$false
+            # Use ConvertToJsonCompat with proper depth and ensure ASCII escaping for special characters
+            $uploadJson = ConvertToJsonCompat $uploadContent
             
             # Debug: Show JSON structure
             if ($global:Config -and $global:Config.app.debug_enabled) {
@@ -693,7 +754,7 @@ function global:Save-ClipboardRichContentJson {
                 
                 # Validate JSON by parsing it back
                 try {
-                    $testParse = ConvertFrom-Json $uploadJson
+                    $testParse = ConvertFromJsonCompat $uploadJson
                     Write-DebugMsg "JSON validation successful, formats in parsed JSON: $($testParse.formats.PSObject.Properties.Name -join ', ')"
                     
                     # Check RTF content specifically

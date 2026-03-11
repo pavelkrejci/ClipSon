@@ -113,7 +113,7 @@ $handler = {
                     format = "png"
                     size = $imageBytes.Length
                 }
-                $uploadJson = ConvertTo-Json $uploadContent -Depth 10
+                    $uploadJson = ConvertToJsonCompat $uploadContent
                 
                 # Upload to WebDAV
                 Upload-ToWebDAV -Content $uploadJson -Connection $global:webdavConnection -LocalSyncFile $localSyncFile -LocalSyncFile7z $localSyncFile7z -RemoteFilePath $localUploadPath
@@ -189,7 +189,7 @@ $handler = {
                     type = "PLAIN_TEXT"
                     content = $currentContent
                 }
-                $uploadJson = ConvertTo-Json $uploadContent -Depth 10
+                    $uploadJson = ConvertToJsonCompat $uploadContent
                 
                 # Upload to WebDAV
                 Upload-ToWebDAV -Content $uploadJson -Connection $global:webdavConnection -LocalSyncFile $localSyncFile -LocalSyncFile7z $localSyncFile7z -RemoteFilePath $localUploadPath

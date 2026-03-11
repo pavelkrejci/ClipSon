@@ -635,7 +635,7 @@ function global:Upload-ToWebDAV {
         # Validate JSON before upload
         if ($global:Config -and $global:Config.app.debug_enabled) {
             try {
-                $testParse = ConvertFrom-Json $Content
+                $testParse = ConvertFromJsonCompat $Content
                 Write-DebugMsg "Pre-upload JSON validation successful"
                 if ($testParse.type -eq "MULTI_FORMAT_CLIPBOARD" -and $testParse.formats.'text/rtf') {
                     $rtfPreview = $testParse.formats.'text/rtf'.Substring(0, [Math]::Min(50, $testParse.formats.'text/rtf'.Length))
