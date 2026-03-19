@@ -2,7 +2,7 @@
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
 # Helper functions for PowerShell 5.1 compatibility (doesn't support -Depth parameter)
-function ConvertFromJsonCompat {
+function global:ConvertFromJsonCompat {
     param([string]$InputObject)
     
     try {
@@ -18,7 +18,7 @@ function ConvertFromJsonCompat {
     }
 }
 
-function ConvertToJsonCompat {
+function global:ConvertToJsonCompat {
     param(
         [PSObject]$InputObject,
         [switch]$Compress
