@@ -963,13 +963,31 @@ class ClipSon:
     
     def set_clipboard_content(self, content):
         """Set clipboard content using copyq or xclip"""
+        debug_print(f"call set_clipboard_content, length: {len(content)}")
         try:
             if self.use_copyq:
-                # Use -- to prevent copyq from expanding escape sequences like \n, \t, \\
-                result = subprocess.run(['copyq', 'copy', '--', content], check=True)
+                # Use stdin to avoid large/sensitive payload in command line args.
+                # Keep -- so copyq doesn't expand escape sequences.
+                result = subprocess.run(
+                    ['copyq', 'copy', '-'],
+                    input=content,
+                    text=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=True
+                )
+                print(f"Set clipboard plain text ({len(content)} bytes) with copyq, return code: {result.returncode}")
                 return result.returncode == 0
             else:
-                result = subprocess.run(['xclip', '-selection', 'clipboard'], input=content, text=True, check=True)
+                result = subprocess.run(
+                    ['xclip', '-selection', 'clipboard'],
+                    input=content,
+                    text=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=True
+                )
+                print(f"Set clipboard plain text ({len(content)} bytes) with xclip, return code: {result.returncode}")
                 return result.returncode == 0
         except Exception:
             return False
@@ -981,10 +999,24 @@ class ClipSon:
             self.last_image_hash = hashlib.md5(image_data).hexdigest()
             debug_print(f"Updated last_image_hash to prevent re-capture: {self.last_image_hash}")
             if self.use_copyq:
-                result = subprocess.run(['copyq', 'copy', 'image/png', '-'], input=image_data, check=True)
+                result = subprocess.run(
+                    ['copyq', 'copy', 'image/png', '-'],
+                    input=image_data,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=True
+                )
+                print(f"Set clipboard image ({len(image_data)} bytes) with copyq, return code: {result.returncode}")
                 return result.returncode == 0
             else:
-                result = subprocess.run(['xclip', '-selection', 'clipboard', '-t', 'image/png'], input=image_data, check=True)
+                result = subprocess.run(
+                    ['xclip', '-selection', 'clipboard', '-t', 'image/png'],
+                    input=image_data,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=True
+                )
+                print(f"Set clipboard image ({len(image_data)} bytes) with xclip, return code: {result.returncode}")                
                 return result.returncode == 0
         except Exception as e:
             print(f"Error setting clipboard image: {e}")
@@ -1146,9 +1178,15 @@ class ClipSon:
                                 cmd = ['copyq', 'write', '0', format_name, '-']
                                 debug_print(f"Writing first format {format_name}")
                                 with open(temp_file, 'rb') as f:
-                                    result = subprocess.run(cmd, stdin=f, check=True)
+                                    result = subprocess.run(
+                                        cmd,
+                                        stdin=f,
+                                        stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL,
+                                        check=True
+                                    )
                                 if result.returncode != 0:
-                                    debug_print(f"Failed to write format {format_name}")
+                                    print(f"Error: Failed to write format {format_name}")
                                     return False
                                 first_format = format_name
                             else:
@@ -1156,22 +1194,33 @@ class ClipSon:
                                 cmd = ['copyq', 'change', '0', format_name, '-']
                                 debug_print(f"Adding format {format_name}")
                                 with open(temp_file, 'rb') as f:
-                                    result = subprocess.run(cmd, stdin=f, check=True)
+                                    result = subprocess.run(
+                                        cmd,
+                                        stdin=f,
+                                        stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL,
+                                        check=True
+                                    )
                                 if result.returncode != 0:
-                                    debug_print(f"Failed to change format {format_name}")
+                                    print(f"Error: Failed to change format {format_name}")
                                     return False
                     
                     if first_format:
                         # Select the clipboard item to activate it
-                        result = subprocess.run(['copyq', 'select', '0'], check=True)
+                        result = subprocess.run(
+                            ['copyq', 'select', '0'],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            check=True
+                        )
                         if result.returncode == 0:
-                            debug_print(f"Successfully set {len(used)} formats with copyq (file-based)")
+                            print(f"Successfully set {len(used)} formats with copyq (file-based)")
                             return True
                         else:
-                            debug_print("Failed to select clipboard item")
+                            print("Error: Failed to select clipboard item")
                             return False
                     else:
-                        debug_print("No formats to set")
+                        print("Error: No formats to set")
                         return False
             else:
                 # xclip: only supports one format at a time, prefer text/html > text/rtf > text/plain
@@ -1193,8 +1242,15 @@ class ClipSon:
             debug_print(f"Setting {format_type} format with xclip")
             debug_print(f"Content excerpt: {content[:120]}{'...' if len(content) > 120 else ''}")
             
-            result = subprocess.run(['xclip', '-selection', 'clipboard', '-t', format_type], 
-                input=content, text=True, check=True)
+            result = subprocess.run(
+                ['xclip', '-selection', 'clipboard', '-t', format_type],
+                input=content,
+                text=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=True
+            )
+            print(f"Set clipboard format {format_type} with xclip, return code: {result.returncode}")
             return result.returncode == 0
         except Exception as e:
             print(f"Error setting clipboard format {format_type}: {e}")
@@ -1241,7 +1297,13 @@ class ClipSon:
                     # Set both text/uri-list and text/plain for better compatibility
                     # Use -- to prevent escape sequence expansion in file paths
                     args = ['copyq', 'copy', '--', 'text/uri-list', uri_content, 'text/plain', uri_content]
-                    result = subprocess.run(args, check=True)
+                    result = subprocess.run(
+                        args,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        check=True
+                    )
+                    print(f"Set clipboard with file URIs using copyq, return code: {result.returncode}")
                     success = result.returncode == 0
                 else:
                     # Use xclip to set text/uri-list
@@ -1297,7 +1359,7 @@ class ClipSon:
                         return self.set_clipboard_multiple_formats(data["formats"])
                 elif content_type == "PLAIN_TEXT":
                     if "content" in data:
-                        debug_print(f"PLAIN_TEXT content: {repr(data['content'])}")
+                        debug_print(f"PLAIN_TEXT content: {repr(data['content'][:50])}{'...' if len(data['content']) > 50 else ''}")
                         # Use content directly - JSON parsing already handles Unicode escaping
                         return self.set_clipboard_content(data["content"])
                     else:
@@ -1311,10 +1373,10 @@ class ClipSon:
                         debug_print("CLIPBOARD_FILES but no files field")
                         return False
             except Exception as e:
-                print(f"DEBUG: Failed to parse JSON clipboard content: {e}")            
+                print(f"Error: Failed to parse JSON clipboard content: {e}")
         except Exception as e:
             print(f"Error setting unified clipboard content: {e}")
-            return self.set_clipboard_content(content)
+            return self.set_clipboard_content(content)        
 
     def get_current_clipboard_fingerprint(self):
         """Get current clipboard content fingerprint for comparison"""
@@ -1545,7 +1607,7 @@ class ClipSon:
                     # Update the last known fingerprint
                     self.last_clipboard_content = current_fingerprint
                 elif current_fingerprint:
-                    debug_print(f"Clipboard content unchanged, skipping...")
+                    debug_print(f"Local clipboard content unchanged, saving skipped ...")
                 else:
                     debug_print(f"No clipboard content detected.")
                 
