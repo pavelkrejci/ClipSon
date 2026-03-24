@@ -169,6 +169,138 @@ function global:Test-ClipboardFiles {
     }
 }
 
+function global:Get-ClipboardFingerprint {
+    try {
+        # Use deterministic fingerprints to suppress duplicate event storms.
+        if ([System.Windows.Forms.Clipboard]::ContainsImage()) {
+            $image = [System.Windows.Forms.Clipboard]::GetImage()
+            if ($image -ne $null) {
+                $memoryStream = New-Object System.IO.MemoryStream
+                try {
+                    $image.Save($memoryStream, [System.Drawing.Imaging.ImageFormat]::Png)
+                    $imageBytes = $memoryStream.ToArray()
+                    if ($imageBytes.Length -gt 0) {
+                        $md5 = [System.Security.Cryptography.MD5]::Create()
+                        try {
+                            $hashBytes = $md5.ComputeHash($imageBytes)
+                            $imageHash = [System.BitConverter]::ToString($hashBytes) -replace '-'
+                        }
+                        finally {
+                            $md5.Dispose()
+                        }
+
+                        return (ConvertToJsonCompat @{
+                            type = "CLIPBOARD_IMAGE"
+                            hash = $imageHash
+                            size = $imageBytes.Length
+                        } -Compress)
+                    }
+                }
+                finally {
+                    $memoryStream.Dispose()
+                    $image.Dispose()
+                }
+            }
+        }
+
+        if (Test-ClipboardFiles) {
+            $fileList = Get-ClipboardFiles
+            if ($fileList -and $fileList.Count -gt 0) {
+                $fileInfo = @{}
+                foreach ($path in ($fileList | Sort-Object)) {
+                    try {
+                        if (Test-Path $path) {
+                            $item = Get-Item $path -ErrorAction Stop
+                            $fileInfo[$path] = @{
+                                size = $item.Length
+                                mtime = $item.LastWriteTimeUtc.Ticks
+                            }
+                        }
+                        else {
+                            $fileInfo[$path] = @{ missing = $true }
+                        }
+                    }
+                    catch {
+                        $fileInfo[$path] = @{ error = $true }
+                    }
+                }
+
+                return (ConvertToJsonCompat @{
+                    type = "CLIPBOARD_FILES"
+                    files = $fileInfo
+                } -Compress)
+            }
+        }
+
+        if (Test-ClipboardRichText) {
+            $formats = Get-ClipboardFormats
+            $comparisonData = @{}
+
+            if ($formats -contains "HTML") {
+                try {
+                    $htmlContent = [System.Windows.Forms.Clipboard]::GetText([System.Windows.Forms.TextDataFormat]::Html)
+                    if ($htmlContent) {
+                        $md5 = [System.Security.Cryptography.MD5]::Create()
+                        try {
+                            $hashBytes = $md5.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($htmlContent))
+                            $comparisonData["text/html"] = ([System.BitConverter]::ToString($hashBytes) -replace '-')
+                        }
+                        finally {
+                            $md5.Dispose()
+                        }
+                    }
+                }
+                catch { }
+            }
+
+            if ($formats -contains "Text" -or $formats -contains "Unicode") {
+                try {
+                    $textContent = [System.Windows.Forms.Clipboard]::GetText()
+                    if ($textContent) {
+                        $md5 = [System.Security.Cryptography.MD5]::Create()
+                        try {
+                            $hashBytes = $md5.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($textContent))
+                            $comparisonData["text/plain"] = ([System.BitConverter]::ToString($hashBytes) -replace '-')
+                        }
+                        finally {
+                            $md5.Dispose()
+                        }
+                    }
+                }
+                catch { }
+            }
+
+            if ($comparisonData.Count -gt 0) {
+                return (ConvertToJsonCompat @{ formats = $comparisonData } -Compress)
+            }
+        }
+
+        if ([System.Windows.Forms.Clipboard]::ContainsText()) {
+            $text = [System.Windows.Forms.Clipboard]::GetText()
+            if (-not [string]::IsNullOrWhiteSpace($text)) {
+                $md5 = [System.Security.Cryptography.MD5]::Create()
+                try {
+                    $hashBytes = $md5.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($text))
+                    $textHash = [System.BitConverter]::ToString($hashBytes) -replace '-'
+                }
+                finally {
+                    $md5.Dispose()
+                }
+
+                return (ConvertToJsonCompat @{
+                    type = "PLAIN_TEXT"
+                    hash = $textHash
+                } -Compress)
+            }
+        }
+
+        return ""
+    }
+    catch {
+        return ""
+    }
+}
+
 function global:Get-ClipboardFiles {
     try {
         if ([System.Windows.Forms.Clipboard]::ContainsFileDropList()) {

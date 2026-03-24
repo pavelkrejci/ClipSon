@@ -39,8 +39,30 @@ catch {
 # Initialize globals
 $global:EnableDebugMessages = $global:Config.app.debug_enabled
 $global:skipClipboardCheckUntil = [DateTime]::MinValue
+$global:lastClipboardFingerprint = ""
 $global:exitLoop = $false
+$global:isShuttingDown = $false
 $global:tempFilesToCleanup = @()
+
+$monitorEventSourceId = "ClipSon.ClipboardChanged"
+
+function Remove-ClipSonEventSubscriptions {
+    param([string]$SourceIdentifier)
+
+    $subscriptions = Get-EventSubscriber -SourceIdentifier $SourceIdentifier -ErrorAction SilentlyContinue
+    if ($subscriptions) {
+        foreach ($subscription in $subscriptions) {
+            $actionJob = $subscription.Action
+            Unregister-Event -SubscriptionId $subscription.SubscriptionId -ErrorAction SilentlyContinue
+            if ($actionJob) {
+                Remove-Job -Id $actionJob.Id -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+}
+
+# Remove stale subscriptions from prior interrupted runs in the same host process.
+Remove-ClipSonEventSubscriptions -SourceIdentifier $monitorEventSourceId
 
 
 
@@ -81,10 +103,24 @@ $remoteCheckInterval = [TimeSpan]::FromSeconds($global:Config.app.remote_check_i
 $monitor = New-Object ClipboardMonitor
 $handler = {
     try {
+        if ($global:isShuttingDown) {
+            return
+        }
+
         # Check if we should skip clipboard monitoring (after setting remote content)
         $currentTime = [DateTime]::Now
         if ($currentTime -lt $global:skipClipboardCheckUntil) {
             Write-DebugMsg "Skipping clipboard check due to recent remote update"
+            return
+        }
+
+        $currentFingerprint = Get-ClipboardFingerprint
+        if ([string]::IsNullOrWhiteSpace($currentFingerprint)) {
+            Write-DebugMsg "Skipping clipboard check because no stable fingerprint is available"
+            return
+        }
+        if ($global:lastClipboardFingerprint -and $currentFingerprint -eq $global:lastClipboardFingerprint) {
+            Write-DebugMsg "Skipping duplicate clipboard event (fingerprint unchanged)"
             return
         }
         
@@ -117,6 +153,7 @@ $handler = {
                 
                 # Upload to WebDAV
                 Upload-ToWebDAV -Content $uploadJson -Connection $global:webdavConnection -LocalSyncFile $localSyncFile -LocalSyncFile7z $localSyncFile7z -RemoteFilePath $localUploadPath
+                $global:lastClipboardFingerprint = $currentFingerprint
                 
                 # Show notification for image capture
                 Show-ClipboardNotification -Title "ClipSon" -Message "Image captured" -Icon "Info"
@@ -130,6 +167,7 @@ $handler = {
             
             $result = Save-ClipboardFiles
             if ($result) {
+                $global:lastClipboardFingerprint = $currentFingerprint
                 Write-DebugMsg "Files saved and uploaded successfully"
             }
         }
@@ -172,7 +210,10 @@ $handler = {
             
             if ($currentFormatData.Count -gt 0) {
                 Write-DebugMsg "Rich content changed, saving..."
-                Save-ClipboardRichContentJson -FormatData $currentFormatData
+                $saved = Save-ClipboardRichContentJson -FormatData $currentFormatData
+                if ($saved) {
+                    $global:lastClipboardFingerprint = $currentFingerprint
+                }
             }
         }
         # Check if clipboard has text content (lowest priority)
@@ -193,6 +234,7 @@ $handler = {
                 
                 # Upload to WebDAV
                 Upload-ToWebDAV -Content $uploadJson -Connection $global:webdavConnection -LocalSyncFile $localSyncFile -LocalSyncFile7z $localSyncFile7z -RemoteFilePath $localUploadPath
+                $global:lastClipboardFingerprint = $currentFingerprint
                 
                 # Show notification for local clipboard capture
                 $preview = if ($currentContent.Length -gt 50) { $currentContent.Substring(0, 50) + "..." } else { $currentContent }
@@ -212,12 +254,12 @@ $handler = {
 Write-Host "ClipSon clipboard monitor starting..." -ForegroundColor Cyan
 
 # Register the event handler with the monitor
-$monitorEvent = Register-ObjectEvent -InputObject $monitor -EventName ClipboardChanged -Action $handler
+$monitorEvent = Register-ObjectEvent -InputObject $monitor -EventName ClipboardChanged -SourceIdentifier $monitorEventSourceId -Action $handler
 $monitor.CreateControl()
 $monitor.Show()  # CRITICAL: Must show the window to receive Windows messages
 
 # Register exit handler
-$exitEvent = Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action { 
+$exitEvent = Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action {
     $global:exitLoop = $true
 }
 
@@ -248,14 +290,14 @@ try {
                 $result = Check-AllRemoteFilesForUpdates -Connection $global:webdavConnection -RemoteFolder $global:Config.nextcloud.remote_folder -CheckInterval $remoteCheckInterval
                 
                 if ($result) {
+                    # Set skip flag BEFORE writing clipboard to avoid race with WM_CLIPBOARDUPDATE.
+                    $global:skipClipboardCheckUntil = [DateTime]::Now.AddSeconds(2)
                     Set-ClipboardContentUnified -Content $result.Content
+                    $global:lastClipboardFingerprint = Get-ClipboardFingerprint
                     
                     # Show notification
                     $preview = if ($result.Content.Length -gt 50) { $result.Content.Substring(0, 50) + "..." } else { $result.Content }
                     Show-ClipboardNotification -Title "ClipSon" -Message "Remote update from $($result.Filename)" -Icon "Info"
-                    
-                    # Set flag to skip clipboard monitoring briefly
-                    $global:skipClipboardCheckUntil = [DateTime]::Now.AddSeconds(2)
                 }
             }
             catch [System.Management.Automation.PipelineStoppedException] {
@@ -282,15 +324,25 @@ catch {
 finally {
     # Very simple cleanup - no timer to worry about now!
     Write-Host "ClipSon shutting down..." -ForegroundColor Yellow
+    $global:isShuttingDown = $true
+    $global:skipClipboardCheckUntil = [DateTime]::MaxValue
     
     # Unregister events before disposing objects
     if ($monitorEvent) {
         Unregister-Event -SubscriptionId $monitorEvent.Id -ErrorAction SilentlyContinue
+        if ($monitorEvent.Action) {
+            Remove-Job -Id $monitorEvent.Action.Id -Force -ErrorAction SilentlyContinue
+        }
     }
     
     if ($exitEvent) {
         Unregister-Event -SubscriptionId $exitEvent.Id -ErrorAction SilentlyContinue
+        if ($exitEvent.Action) {
+            Remove-Job -Id $exitEvent.Action.Id -Force -ErrorAction SilentlyContinue
+        }
     }
+
+    Remove-ClipSonEventSubscriptions -SourceIdentifier $monitorEventSourceId
     
     # Dispose the monitor object last
     if ($monitor) {
