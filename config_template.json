@@ -16,7 +16,7 @@
         "remote_check_interval_seconds": 1,
         "debug_enabled": false,
         "use_copyq": true,
-        "use_7z_encryption": true,
+        "use_encryption": true,
         "max_file_copy_size_mb": 500
     }
 }

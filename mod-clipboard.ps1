@@ -420,7 +420,7 @@ function global:Save-ClipboardFiles {
             $uploadJson = ConvertToJsonCompat $uploadContent
             
             # Upload to WebDAV
-            Upload-ToWebDAV -Content $uploadJson -Connection $global:webdavConnection -LocalSyncFile $global:localSyncFile -LocalSyncFile7z $global:localSyncFile7z -RemoteFilePath $global:localUploadPath
+            Upload-ToWebDAV -Content $uploadJson -Connection $global:webdavConnection -LocalSyncFile $global:localSyncFile -LocalSyncFileArchive $global:localSyncFileArchive -RemoteFilePath $global:localUploadPath
             
             # Show notification
             $fileNames = $filesData.Keys | Select-Object -First 3
@@ -903,7 +903,7 @@ function global:Save-ClipboardRichContentJson {
             }
             
             # Upload to WebDAV
-            Upload-ToWebDAV -Content $uploadJson -Connection $global:webdavConnection -LocalSyncFile $global:localSyncFile -LocalSyncFile7z $global:localSyncFile7z -RemoteFilePath $global:localUploadPath
+            Upload-ToWebDAV -Content $uploadJson -Connection $global:webdavConnection -LocalSyncFile $global:localSyncFile -LocalSyncFileArchive $global:localSyncFileArchive -RemoteFilePath $global:localUploadPath
             
             # Show notification
             $formatList = ($FormatData.Keys | Select-Object -First 3) -join ', '

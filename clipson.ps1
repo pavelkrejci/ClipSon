@@ -89,7 +89,7 @@ if (-not (Test-NextcloudConnection -Connection $global:webdavConnection)) {
 $hostname = $env:COMPUTERNAME
 $global:localSyncFile = ".\clipboard-$hostname.json"
 $archiveExtension = Get-ArchiveExtension
-$global:localSyncFile7z = ".\clipboard-$hostname$archiveExtension"
+$global:localSyncFileArchive = ".\clipboard-$hostname$archiveExtension"
 $global:localUploadPath = $global:Config.nextcloud.remote_folder + "clipboard-$hostname$archiveExtension"
 
 # Global variables
@@ -152,7 +152,7 @@ $handler = {
                     $uploadJson = ConvertToJsonCompat $uploadContent
                 
                 # Upload to WebDAV
-                Upload-ToWebDAV -Content $uploadJson -Connection $global:webdavConnection -LocalSyncFile $localSyncFile -LocalSyncFile7z $localSyncFile7z -RemoteFilePath $localUploadPath
+                Upload-ToWebDAV -Content $uploadJson -Connection $global:webdavConnection -LocalSyncFile $localSyncFile -LocalSyncFileArchive $localSyncFileArchive -RemoteFilePath $localUploadPath
                 $global:lastClipboardFingerprint = $currentFingerprint
                 
                 # Show notification for image capture
@@ -233,7 +233,7 @@ $handler = {
                     $uploadJson = ConvertToJsonCompat $uploadContent
                 
                 # Upload to WebDAV
-                Upload-ToWebDAV -Content $uploadJson -Connection $global:webdavConnection -LocalSyncFile $localSyncFile -LocalSyncFile7z $localSyncFile7z -RemoteFilePath $localUploadPath
+                Upload-ToWebDAV -Content $uploadJson -Connection $global:webdavConnection -LocalSyncFile $localSyncFile -LocalSyncFileArchive $localSyncFileArchive -RemoteFilePath $localUploadPath
                 $global:lastClipboardFingerprint = $currentFingerprint
                 
                 # Show notification for local clipboard capture

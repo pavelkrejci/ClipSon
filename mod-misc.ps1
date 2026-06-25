@@ -19,12 +19,12 @@ function Get-Configuration {
 }
 
 function Get-ArchiveExtension {
-    $use7z = $true
-    if ($global:Config -and $global:Config.app -and $global:Config.app.PSObject.Properties.Name -contains "use_7z_encryption") {
-        $use7z = [bool]$global:Config.app.use_7z_encryption
+    $useEncryption = $true
+    if ($global:Config -and $global:Config.app -and $global:Config.app.PSObject.Properties.Name -contains "use_encryption") {
+        $useEncryption = [bool]$global:Config.app.use_encryption
     }
 
-    return $(if ($use7z) { ".cpsn" } else { ".gz" })
+    return $(if ($useEncryption) { ".cpsn" } else { ".gz" })
 }
 
 function Get-PasswordIfNeeded {
@@ -44,128 +44,174 @@ function Get-PasswordIfNeeded {
     }
 }
 
-function Get-7zExecutablePath {
-    # Prefer known install locations, then fall back to PATH
-    $isWindows = $env:OS -eq 'Windows_NT'
+# --- Encryption constants ---
+$script:CPSN_VERSION = 2
+$script:PBKDF2_ITERATIONS = 100000
+$script:SALT_SIZE = 32
+$script:IV_SIZE = 16
+$script:HMAC_SIZE = 32
+$script:AES_KEY_SIZE = 32  # AES-256
 
-    if ($isWindows) {
-        $preferred = "C:\Program Files\7-Zip\7z.exe"
-        if (Test-Path $preferred) { return $preferred }
-    } else {
-        $preferred = "/usr/bin/7z"
-        if (Test-Path $preferred) { return $preferred }
-    }
-
-    $cmd = Get-Command 7z -ErrorAction SilentlyContinue
-    if ($cmd -and $cmd.Source) { return $cmd.Source }
-
-    throw "7z executable not found (expected $preferred or 7z in PATH)"
-}
-
-function Test-HasCpsnHeader {
+function Get-DerivedKeys {
     param(
         [Parameter(Mandatory=$true)]
-        [string]$Path
+        [string]$Password,
+        [Parameter(Mandatory=$true)]
+        [byte[]]$Salt
     )
-    try {
-        if (-not (Test-Path $Path)) { return $false }
-        $fs = [System.IO.File]::OpenRead($Path)
-        try {
-            if ($fs.Length -lt 4) { return $false }
-            $buf = New-Object byte[] 4
-            $read = $fs.Read($buf, 0, 4)
-            if ($read -ne 4) { return $false }
-            $sig = [System.Text.Encoding]::ASCII.GetString($buf)
-            return ($sig -eq "CPSN")
-        }
-        finally {
-            $fs.Close()
-        }
-    }
-    catch {
-        return $false
-    }
+    # PBKDF2-SHA256 → 64 bytes (32 AES key + 32 HMAC key)
+    $deriveBytes = New-Object System.Security.Cryptography.Rfc2898DeriveBytes(
+        $Password,
+        $Salt,
+        $script:PBKDF2_ITERATIONS,
+        [System.Security.Cryptography.HashAlgorithmName]::SHA256
+    )
+    $dk = $deriveBytes.GetBytes(64)
+    $deriveBytes.Dispose()
+
+    $aesKey = New-Object byte[] 32
+    $hmacKey = New-Object byte[] 32
+    [Array]::Copy($dk, 0, $aesKey, 0, 32)
+    [Array]::Copy($dk, 32, $hmacKey, 0, 32)
+
+    return @{ AesKey = $aesKey; HmacKey = $hmacKey }
 }
 
-function Add-CpsnHeaderToFile {
+function Protect-Data {
     param(
         [Parameter(Mandatory=$true)]
-        [string]$Path
+        [byte[]]$Plaintext,
+        [Parameter(Mandatory=$true)]
+        [string]$Password
     )
+    # Generate random salt and IV
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    $salt = New-Object byte[] $script:SALT_SIZE
+    $iv = New-Object byte[] $script:IV_SIZE
+    $rng.GetBytes($salt)
+    $rng.GetBytes($iv)
+    $rng.Dispose()
 
-    if (Test-HasCpsnHeader -Path $Path) {
-        if ($global:Config -and $global:Config.app.debug_enabled) {
-            Write-DebugMsg "CPSN header already present: $Path"
-        }
-        return
-    }
+    $keys = Get-DerivedKeys -Password $Password -Salt $salt
 
-    $dir = Split-Path -Parent $Path
-    $tmp = Join-Path $dir ("." + ([System.IO.Path]::GetFileName($Path)) + "." + [System.Guid]::NewGuid().ToString("N") + ".cpsn")
+    # AES-256-CBC encryption with PKCS7 padding
+    $aes = [System.Security.Cryptography.Aes]::Create()
+    $aes.KeySize = 256
+    $aes.BlockSize = 128
+    $aes.Mode = [System.Security.Cryptography.CipherMode]::CBC
+    $aes.Padding = [System.Security.Cryptography.PaddingMode]::PKCS7
+    $aes.Key = $keys.AesKey
+    $aes.IV = $iv
 
-    $prefix = [System.Text.Encoding]::ASCII.GetBytes("CPSN")
-    $inStream = [System.IO.File]::OpenRead($Path)
-    try {
-        $outStream = [System.IO.File]::Create($tmp)
-        try {
-            $outStream.Write($prefix, 0, $prefix.Length)
-            $inStream.CopyTo($outStream)
-        }
-        finally {
-            $outStream.Close()
-        }
-    }
-    finally {
-        $inStream.Close()
-    }
+    $encryptor = $aes.CreateEncryptor()
+    $ciphertext = $encryptor.TransformFinalBlock($Plaintext, 0, $Plaintext.Length)
+    $encryptor.Dispose()
+    $aes.Dispose()
 
-    Move-Item -LiteralPath $tmp -Destination $Path -Force
+    # HMAC-SHA256 over (version + salt + iv + ciphertext)
+    $versionByte = [byte[]]@($script:CPSN_VERSION)
+    $macData = New-Object byte[] ($versionByte.Length + $salt.Length + $iv.Length + $ciphertext.Length)
+    $offset = 0
+    [Array]::Copy($versionByte, 0, $macData, $offset, $versionByte.Length); $offset += $versionByte.Length
+    [Array]::Copy($salt, 0, $macData, $offset, $salt.Length); $offset += $salt.Length
+    [Array]::Copy($iv, 0, $macData, $offset, $iv.Length); $offset += $iv.Length
+    [Array]::Copy($ciphertext, 0, $macData, $offset, $ciphertext.Length)
 
-    if ($global:Config -and $global:Config.app.debug_enabled) {
-        Write-DebugMsg "Prepended CPSN header: $Path"
-    }
+    $hmac = New-Object System.Security.Cryptography.HMACSHA256
+    $hmac.Key = $keys.HmacKey
+    $mac = $hmac.ComputeHash($macData)
+    $hmac.Dispose()
+
+    # Assemble: CPSN(4) + version(1) + salt(32) + iv(16) + ciphertext + hmac(32)
+    $magic = [System.Text.Encoding]::ASCII.GetBytes("CPSN")
+    $result = New-Object byte[] ($magic.Length + $versionByte.Length + $salt.Length + $iv.Length + $ciphertext.Length + $mac.Length)
+    $offset = 0
+    [Array]::Copy($magic, 0, $result, $offset, $magic.Length); $offset += $magic.Length
+    [Array]::Copy($versionByte, 0, $result, $offset, $versionByte.Length); $offset += $versionByte.Length
+    [Array]::Copy($salt, 0, $result, $offset, $salt.Length); $offset += $salt.Length
+    [Array]::Copy($iv, 0, $result, $offset, $iv.Length); $offset += $iv.Length
+    [Array]::Copy($ciphertext, 0, $result, $offset, $ciphertext.Length); $offset += $ciphertext.Length
+    [Array]::Copy($mac, 0, $result, $offset, $mac.Length)
+
+    return $result
 }
 
-function Strip-CpsnHeaderToFile {
+function Unprotect-Data {
     param(
         [Parameter(Mandatory=$true)]
-        [string]$InputPath,
+        [byte[]]$Data,
         [Parameter(Mandatory=$true)]
-        [string]$OutputPath
+        [string]$Password
     )
-
-    $inStream = [System.IO.File]::OpenRead($InputPath)
-    try {
-        $buf = New-Object byte[] 4
-        $read = $inStream.Read($buf, 0, 4)
-        $sig = if ($read -eq 4) { [System.Text.Encoding]::ASCII.GetString($buf) } else { "" }
-
-        $outStream = [System.IO.File]::Create($OutputPath)
-        try {
-            if ($sig -eq "CPSN") {
-                # Copy remaining bytes (after header)
-                $inStream.CopyTo($outStream)
-                if ($global:Config -and $global:Config.app.debug_enabled) {
-                    Write-DebugMsg "Detected CPSN header; stripped to: $OutputPath"
-                }
-            } else {
-                # Not CPSN: write back the bytes we already read then rest
-                if ($read -gt 0) {
-                    $outStream.Write($buf, 0, $read)
-                }
-                $inStream.CopyTo($outStream)
-                if ($global:Config -and $global:Config.app.debug_enabled) {
-                    Write-DebugMsg "No CPSN header; copied archive to: $OutputPath"
-                }
-            }
-        }
-        finally {
-            $outStream.Close()
-        }
+    $minSize = 4 + 1 + $script:SALT_SIZE + $script:IV_SIZE + $script:HMAC_SIZE + 16
+    if ($Data.Length -lt $minSize) {
+        throw "Data too short to be a valid CPSN v2 archive"
     }
-    finally {
-        $inStream.Close()
+
+    $offset = 0
+    $magic = [System.Text.Encoding]::ASCII.GetString($Data, $offset, 4); $offset += 4
+    if ($magic -ne "CPSN") {
+        throw "Invalid CPSN magic header"
     }
+
+    $version = $Data[$offset]; $offset += 1
+    if ($version -ne $script:CPSN_VERSION) {
+        throw "Unsupported CPSN version: $version"
+    }
+
+    $salt = New-Object byte[] $script:SALT_SIZE
+    [Array]::Copy($Data, $offset, $salt, 0, $script:SALT_SIZE); $offset += $script:SALT_SIZE
+
+    $iv = New-Object byte[] $script:IV_SIZE
+    [Array]::Copy($Data, $offset, $iv, 0, $script:IV_SIZE); $offset += $script:IV_SIZE
+
+    $ciphertextLen = $Data.Length - $offset - $script:HMAC_SIZE
+    $ciphertext = New-Object byte[] $ciphertextLen
+    [Array]::Copy($Data, $offset, $ciphertext, 0, $ciphertextLen)
+
+    $storedMac = New-Object byte[] $script:HMAC_SIZE
+    [Array]::Copy($Data, $Data.Length - $script:HMAC_SIZE, $storedMac, 0, $script:HMAC_SIZE)
+
+    $keys = Get-DerivedKeys -Password $Password -Salt $salt
+
+    # Verify HMAC (Encrypt-then-MAC)
+    $versionByte = [byte[]]@($version)
+    $macData = New-Object byte[] ($versionByte.Length + $salt.Length + $iv.Length + $ciphertext.Length)
+    $macOffset = 0
+    [Array]::Copy($versionByte, 0, $macData, $macOffset, $versionByte.Length); $macOffset += $versionByte.Length
+    [Array]::Copy($salt, 0, $macData, $macOffset, $salt.Length); $macOffset += $salt.Length
+    [Array]::Copy($iv, 0, $macData, $macOffset, $iv.Length); $macOffset += $iv.Length
+    [Array]::Copy($ciphertext, 0, $macData, $macOffset, $ciphertext.Length)
+
+    $hmac = New-Object System.Security.Cryptography.HMACSHA256
+    $hmac.Key = $keys.HmacKey
+    $expectedMac = $hmac.ComputeHash($macData)
+    $hmac.Dispose()
+
+    # Constant-time comparison
+    $diff = 0
+    for ($i = 0; $i -lt $script:HMAC_SIZE; $i++) {
+        $diff = $diff -bor ($storedMac[$i] -bxor $expectedMac[$i])
+    }
+    if ($diff -ne 0) {
+        throw "HMAC verification failed - wrong password or corrupted data"
+    }
+
+    # Decrypt AES-256-CBC
+    $aes = [System.Security.Cryptography.Aes]::Create()
+    $aes.KeySize = 256
+    $aes.BlockSize = 128
+    $aes.Mode = [System.Security.Cryptography.CipherMode]::CBC
+    $aes.Padding = [System.Security.Cryptography.PaddingMode]::PKCS7
+    $aes.Key = $keys.AesKey
+    $aes.IV = $iv
+
+    $decryptor = $aes.CreateDecryptor()
+    $plaintext = $decryptor.TransformFinalBlock($ciphertext, 0, $ciphertext.Length)
+    $decryptor.Dispose()
+    $aes.Dispose()
+
+    return $plaintext
 }
 
 function Get-ArchiveFormat {
@@ -178,16 +224,13 @@ function Get-ArchiveFormat {
         if (-not (Test-Path $Path)) { return "unknown" }
         $fs = [System.IO.File]::OpenRead($Path)
         try {
-            $buf = New-Object byte[] 6
-            $read = $fs.Read($buf, 0, 6)
+            $buf = New-Object byte[] 4
+            $read = $fs.Read($buf, 0, 4)
             if ($read -ge 4) {
-                $sig = [System.Text.Encoding]::ASCII.GetString($buf, 0, [Math]::Min(4, $read))
+                $sig = [System.Text.Encoding]::ASCII.GetString($buf, 0, 4)
                 if ($sig -eq "CPSN") { return "cpsn" }
             }
             if ($read -ge 2 -and $buf[0] -eq 0x1f -and $buf[1] -eq 0x8b) { return "gzip" }
-            if ($read -eq 6 -and $buf[0] -eq 0x37 -and $buf[1] -eq 0x7a -and $buf[2] -eq 0xbc -and $buf[3] -eq 0xaf -and $buf[4] -eq 0x27 -and $buf[5] -eq 0x1c) {
-                return "7z"
-            }
             return "unknown"
         }
         finally {
@@ -207,21 +250,21 @@ function Compress-JsonFile {
         [string]$GzFile
     )
 
-    $use7z = $true
-    if ($global:Config -and $global:Config.app -and $global:Config.app.PSObject.Properties.Name -contains "use_7z_encryption") {
-        $use7z = [bool]$global:Config.app.use_7z_encryption
+    $useEncryption = $true
+    if ($global:Config -and $global:Config.app -and $global:Config.app.PSObject.Properties.Name -contains "use_encryption") {
+        $useEncryption = [bool]$global:Config.app.use_encryption
     }
 
-    if ($use7z) {
-        $encOk = Compress-JsonFileWith7z -JsonFile $JsonFile -GzFile $GzFile
+    if ($useEncryption) {
+        $encOk = Compress-JsonFileWithEncryption -JsonFile $JsonFile -GzFile $GzFile
         if ($encOk) { return $true }
-        Write-DebugMsg "7z compression failed or unavailable; falling back to gzip"
+        Write-DebugMsg "Encryption failed; falling back to gzip"
     }
 
     return Compress-JsonFileWithGzip -JsonFile $JsonFile -GzFile $GzFile
 }
 
-function Compress-JsonFileWith7z {
+function Compress-JsonFileWithEncryption {
     param(
         [Parameter(Mandatory=$true)]
         [string]$JsonFile,
@@ -229,7 +272,6 @@ function Compress-JsonFileWith7z {
         [string]$GzFile
     )
     try {
-        $sevenZip = Get-7zExecutablePath
         $password = $global:Config.nextcloud.password
         if ([string]::IsNullOrWhiteSpace($password)) {
             throw "Nextcloud password is empty; cannot encrypt"
@@ -237,57 +279,37 @@ function Compress-JsonFileWith7z {
 
         $originalSize = (Get-Item $JsonFile).Length
 
-        $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("clipson-7z-" + [System.Guid]::NewGuid().ToString("N"))
-        New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
+        # Read and gzip-compress the JSON data
+        $rawData = [System.IO.File]::ReadAllBytes($JsonFile)
 
-        try {
-            # Put a stable name inside the archive.
-            $payloadPath = Join-Path $tempDir "payload.json"
-            Copy-Item -LiteralPath $JsonFile -Destination $payloadPath -Force
+        $memStream = New-Object System.IO.MemoryStream
+        $gzipStream = New-Object System.IO.Compression.GzipStream($memStream, [System.IO.Compression.CompressionLevel]::Optimal, $true)
+        $gzipStream.Write($rawData, 0, $rawData.Length)
+        $gzipStream.Dispose()
+        $compressed = $memStream.ToArray()
+        $memStream.Dispose()
 
-            if (Test-Path $GzFile) {
-                Remove-Item -LiteralPath $GzFile -Force -ErrorAction SilentlyContinue
-            }
+        # Encrypt the compressed data
+        $encrypted = Protect-Data -Plaintext $compressed -Password $password
 
-            # Note: keep legacy .gz naming, but output is a 7z-encrypted archive.
-            $args = @(
-                "a",
-                "-t7z",
-                "-mhe=on",
-                "-y",
-                "-bd",
-                ("-p" + $password),
-                $GzFile,
-                $payloadPath
-            )
+        # Write atomically
+        $tempPath = "$GzFile.$([System.Guid]::NewGuid().ToString('N')).tmp"
+        [System.IO.File]::WriteAllBytes($tempPath, $encrypted)
+        Move-Item -LiteralPath $tempPath -Destination $GzFile -Force
 
-            $output = & $sevenZip @args 2>&1
-            if ($LASTEXITCODE -ne 0) {
-                if ($global:Config.app.debug_enabled) {
-                    Write-DebugMsg "7z encryption failed (exit $LASTEXITCODE): $output"
-                } else {
-                    Write-DebugMsg "7z encryption failed (exit $LASTEXITCODE)"
-                }
-                return $false
-            }
-
-            # Prefix the produced archive bytes with CPSN.
-            Add-CpsnHeaderToFile -Path $GzFile
-
-            $encryptedSize = (Get-Item $GzFile).Length
-            if ($global:Config.app.debug_enabled) {
-                $ratio = if ($originalSize -gt 0) { (1 - $encryptedSize / $originalSize) * 100 } else { 0 }
-                Write-DebugMsg "File encryption $originalSize -> $encryptedSize bytes ($([Math]::Round($ratio, 1))% smaller)"
-            }
-
-            return $true
+        $encryptedSize = (Get-Item $GzFile).Length
+        if ($global:Config.app.debug_enabled) {
+            $ratio = if ($originalSize -gt 0) { (1 - $encryptedSize / $originalSize) * 100 } else { 0 }
+            Write-DebugMsg "File encryption $originalSize -> $encryptedSize bytes ($([Math]::Round($ratio, 1))% smaller)"
         }
-        finally {
-            Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
-        }
+
+        return $true
     }
     catch {
         Write-DebugMsg "File encryption failed: $($_.Exception.Message)"
+        if (Test-Path $tempPath -ErrorAction SilentlyContinue) {
+            Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
+        }
         return $false
     }
 }
@@ -355,24 +377,23 @@ function Decompress-GzFile {
         [string]$JsonFile
     )
 
-    $use7z = $true
-    if ($global:Config -and $global:Config.app -and $global:Config.app.PSObject.Properties.Name -contains "use_7z_encryption") {
-        $use7z = [bool]$global:Config.app.use_7z_encryption
+    $useEncryption = $true
+    if ($global:Config -and $global:Config.app -and $global:Config.app.PSObject.Properties.Name -contains "use_encryption") {
+        $useEncryption = [bool]$global:Config.app.use_encryption
     }
 
     $format = Get-ArchiveFormat -Path $GzFile
     $preferred = switch ($format) {
-        "cpsn" { "7z" }
-        "7z" { "7z" }
+        "cpsn" { "encrypted" }
         "gzip" { "gzip" }
-        default { if ($use7z) { "7z" } else { "gzip" } }
+        default { if ($useEncryption) { "encrypted" } else { "gzip" } }
     }
 
-    $methods = @($preferred, $(if ($preferred -eq "7z") { "gzip" } else { "7z" }))
+    $methods = @($preferred, $(if ($preferred -eq "encrypted") { "gzip" } else { "encrypted" }))
 
     foreach ($method in $methods) {
-        if ($method -eq "7z") {
-            if (Decompress-JsonWith7z -GzFile $GzFile -JsonFile $JsonFile) {
+        if ($method -eq "encrypted") {
+            if (Decompress-EncryptedFile -GzFile $GzFile -JsonFile $JsonFile) {
                 return $true
             }
         } else {
@@ -385,7 +406,7 @@ function Decompress-GzFile {
     return $false
 }
 
-function Decompress-JsonWith7z {
+function Decompress-EncryptedFile {
     param(
         [Parameter(Mandatory=$true)]
         [string]$GzFile,
@@ -393,57 +414,28 @@ function Decompress-JsonWith7z {
         [string]$JsonFile
     )
     try {
-        $sevenZip = Get-7zExecutablePath
         $password = $global:Config.nextcloud.password
         if ([string]::IsNullOrWhiteSpace($password)) {
             throw "Nextcloud password is empty; cannot decrypt"
         }
 
-        $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("clipson-7z-" + [System.Guid]::NewGuid().ToString("N"))
-        New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
+        $data = [System.IO.File]::ReadAllBytes($GzFile)
 
-        try {
-            $archiveToExtract = $GzFile
-            $strippedArchive = Join-Path $tempDir "archive.7z"
-            Strip-CpsnHeaderToFile -InputPath $GzFile -OutputPath $strippedArchive
-            $archiveToExtract = $strippedArchive
+        # Decrypt
+        $compressed = Unprotect-Data -Data $data -Password $password
 
-            $args = @(
-                "x",
-                "-y",
-                "-bd",
-                ("-p" + $password),
-                ("-o" + $tempDir),
-                $archiveToExtract
-            )
+        # Decompress gzip
+        $memStream = New-Object System.IO.MemoryStream(, $compressed)
+        $gzipStream = New-Object System.IO.Compression.GzipStream($memStream, [System.IO.Compression.CompressionMode]::Decompress)
+        $outStream = New-Object System.IO.MemoryStream
+        $gzipStream.CopyTo($outStream)
+        $gzipStream.Dispose()
+        $memStream.Dispose()
+        $rawData = $outStream.ToArray()
+        $outStream.Dispose()
 
-            $output = & $sevenZip @args 2>&1
-            if ($LASTEXITCODE -ne 0) {
-                if ($global:Config.app.debug_enabled) {
-                    Write-DebugMsg "7z decryption failed (exit $LASTEXITCODE): $output"
-                } else {
-                    Write-DebugMsg "7z decryption failed (exit $LASTEXITCODE)"
-                }
-                return $false
-            }
-
-            $payload = Join-Path $tempDir "payload.json"
-            if (-not (Test-Path $payload)) {
-                $first = Get-ChildItem -Path $tempDir -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-                if (-not $first) {
-                    Write-DebugMsg "7z decryption produced no files"
-                    return $false
-                }
-                Copy-Item -LiteralPath $first.FullName -Destination $JsonFile -Force
-                return $true
-            }
-
-            Copy-Item -LiteralPath $payload -Destination $JsonFile -Force
-            return $true
-        }
-        finally {
-            Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
-        }
+        [System.IO.File]::WriteAllBytes($JsonFile, $rawData)
+        return $true
     }
     catch {
         Write-DebugMsg "File decryption failed: $($_.Exception.Message)"

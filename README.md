@@ -79,7 +79,7 @@ Nextcloud clipboard synchronization tool for Linux (Python) and Windows (PowerSh
         "remote_check_interval_seconds": 1, // Interval to check for remote changes
         "debug_enabled": false, // Enable debug logging
         "use_copyq": true, // Use copyq for enhanced multi-MIME support on Linux (requires copyq daemon running)
-        "use_7z_encryption": true, // Disable to fall back to gzip compression without encryption
+        "use_encryption": true, // Disable to fall back to gzip compression without encryption
         "max_file_copy_size_mb": 50 // Maximum file size for file copy feature (in MB)
     }
 ```
@@ -88,26 +88,25 @@ Nextcloud clipboard synchronization tool for Linux (Python) and Windows (PowerSh
 
 ### Windows
 - Windows PowerShell 5.1 or later
-- .NET Framework (usually pre-installed on Windows)
-- 7-Zip (7z) installed at `C:\Program Files\7-Zip\7z.exe` (optional when `use_7z_encryption` is false)
+- .NET Framework 4.7.2+ (usually pre-installed on Windows 10+)
 - Nextcloud account and credentials
 
 ### Linux
 - Python 3.6+
 - Required Python packages (see [requirements.txt](requirements.txt)):
   - requests==2.31.0
+  - cryptography>=41.0.0
 - System dependencies:
   - xclip (required for basic clipboard operations)
   - notify-send/libnotify-bin (required for desktop notifications)
   - copyq (optional, for enhanced multi-MIME clipboard support)
-  - 7z installed at `/usr/bin/7z` (optional when `use_7z_encryption` is false)
 - Nextcloud account and credentials
 
 ### Security note
 
-Clipboard payloads uploaded to WebDAV are encrypted using 7z with a password when `use_7z_encryption` is true; otherwise gzip is used without encryption.
-The password used is the same value as `nextcloud.password` from `config.json`.
-Archive extensions match the compression choice (`.cpsn` for encrypted 7z, `.gz` for gzip), but content is still detected via magic bytes for compatibility.
+Clipboard payloads uploaded to WebDAV are encrypted using AES-256-CBC with HMAC-SHA256 authentication when `use_encryption` is true; otherwise gzip is used without encryption.
+Keys are derived from `nextcloud.password` via PBKDF2-SHA256 (100,000 iterations).
+Archive extensions match the compression choice (`.cpsn` for encrypted, `.gz` for gzip), and content is detected via magic bytes.
 
 ## Known Issues
 

@@ -617,14 +617,14 @@ function global:Upload-ToWebDAV {
         [string]$Content,
         [hashtable]$Connection,
         [string]$LocalSyncFile,
-        [string]$LocalSyncFile7z,
+        [string]$LocalSyncFileArchive,
         [string]$RemoteFilePath
     )
     
     try {
         Write-DebugMsg "Uploading content length: $($Content.Length) to file: $LocalSyncFile"
         if ($global:Config -and $global:Config.app.debug_enabled) {
-            Write-DebugMsg "Upload-ToWebDAV: LocalSyncFile7z='$LocalSyncFile7z' RemoteFilePath='$RemoteFilePath'"
+            Write-DebugMsg "Upload-ToWebDAV: LocalSyncFileArchive='$LocalSyncFileArchive' RemoteFilePath='$RemoteFilePath'"
         }
         
         if ([string]::IsNullOrEmpty($Content)) {
@@ -671,20 +671,20 @@ function global:Upload-ToWebDAV {
             }
         }
 
-        $encryptOk = Compress-JsonFile -JsonFile $LocalSyncFile -GzFile $LocalSyncFile7z
+        $encryptOk = Compress-JsonFile -JsonFile $LocalSyncFile -GzFile $LocalSyncFileArchive
 
         if ($global:Config -and $global:Config.app.debug_enabled) {
             Write-DebugMsg "Upload-ToWebDAV: Encrypt result: $encryptOk"
-            if (Test-Path $LocalSyncFile7z) {
-                $encSize = (Get-Item $LocalSyncFile7z).Length
+            if (Test-Path $LocalSyncFileArchive) {
+                $encSize = (Get-Item $LocalSyncFileArchive).Length
                 Write-DebugMsg "Upload-ToWebDAV: Encrypted file exists, size: $encSize bytes"
             } else {
-                Write-DebugMsg "Upload-ToWebDAV: Encrypted file does NOT exist: $LocalSyncFile7z"
+                Write-DebugMsg "Upload-ToWebDAV: Encrypted file does NOT exist: $LocalSyncFileArchive"
             }
         }
 
         if ($encryptOk) {
-            $uploadResult = Send-FileToNextcloud -Connection $Connection -LocalFilePath $LocalSyncFile7z -RemoteFilePath $RemoteFilePath
+            $uploadResult = Send-FileToNextcloud -Connection $Connection -LocalFilePath $LocalSyncFileArchive -RemoteFilePath $RemoteFilePath
             
             if ($uploadResult) {
                 Write-Host "$(Get-Date -Format 'HH:mm:ss') - Uploaded encrypted to WebDAV: $RemoteFilePath"

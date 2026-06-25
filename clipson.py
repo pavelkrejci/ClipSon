@@ -10,6 +10,7 @@ import time
 import os
 import sys
 import json
+import io
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from datetime import timezone
@@ -20,6 +21,7 @@ import signal
 import getpass
 import base64
 import hashlib
+import hmac
 import re
 import urllib.parse
 import mimetypes
@@ -28,6 +30,11 @@ import shutil
 import uuid
 import gzip
 import atexit
+import struct
+
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives import padding as crypto_padding
+from cryptography.hazmat.backends import default_backend
 
 CPSN_MAGIC = b'CPSN'
 
@@ -86,8 +93,8 @@ class ClipSon:
         get_password_if_needed()
         
         self.hostname = os.uname().nodename
-        self.use_7z_encryption = CONFIG_DATA['app'].get('use_7z_encryption', True)
-        self.archive_extension = '.cpsn' if self.use_7z_encryption else '.gz'
+        self.use_encryption = CONFIG_DATA['app'].get('use_encryption', True)
+        self.archive_extension = '.cpsn' if self.use_encryption else '.gz'
         self.my_sync_filenames = {
             f"clipboard-{self.hostname}.cpsn",
             f"clipboard-{self.hostname}.gz"
@@ -356,114 +363,133 @@ class ClipSon:
         # Fallback to application/octet-stream
         return "application/octet-stream"
 
-    def _get_7z_executable(self):
-        """Return path to 7z executable (Linux)."""
-        preferred = Path('/usr/bin/7z')
-        if preferred.exists():
-            return str(preferred)
+    # --- Encryption constants ---
+    CPSN_VERSION = 2
+    PBKDF2_ITERATIONS = 100000
+    SALT_SIZE = 32
+    IV_SIZE = 16
+    HMAC_SIZE = 32
+    AES_KEY_SIZE = 32  # AES-256
 
-        found = shutil.which('7z')
-        if found:
-            return found
+    def _derive_keys(self, password, salt):
+        """Derive AES key and HMAC key from password using PBKDF2-SHA256."""
+        dk = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, self.PBKDF2_ITERATIONS, dklen=64)
+        aes_key = dk[:32]
+        hmac_key = dk[32:]
+        return aes_key, hmac_key
 
-        raise FileNotFoundError("7z executable not found (expected /usr/bin/7z or 7z in PATH)")
+    def _encrypt_data(self, plaintext, password):
+        """Encrypt data with AES-256-CBC + HMAC-SHA256 (Encrypt-then-MAC).
+        Returns: CPSN header + version + salt + iv + ciphertext + hmac
+        """
+        salt = os.urandom(self.SALT_SIZE)
+        iv = os.urandom(self.IV_SIZE)
+        aes_key, hmac_key = self._derive_keys(password, salt)
+
+        # PKCS7 padding + AES-256-CBC encryption
+        padder = crypto_padding.PKCS7(128).padder()
+        padded = padder.update(plaintext) + padder.finalize()
+
+        cipher = Cipher(algorithms.AES(aes_key), modes.CBC(iv), backend=default_backend())
+        encryptor = cipher.encryptor()
+        ciphertext = encryptor.update(padded) + encryptor.finalize()
+
+        # HMAC over version + salt + iv + ciphertext
+        version_byte = struct.pack('B', self.CPSN_VERSION)
+        mac_data = version_byte + salt + iv + ciphertext
+        mac = hmac.new(hmac_key, mac_data, hashlib.sha256).digest()
+
+        # Assemble: CPSN + version(1) + salt(32) + iv(16) + ciphertext + hmac(32)
+        return CPSN_MAGIC + version_byte + salt + iv + ciphertext + mac
+
+    def _decrypt_data(self, data, password):
+        """Decrypt CPSN v2 encrypted data. Returns plaintext bytes or raises."""
+        if len(data) < 4 + 1 + self.SALT_SIZE + self.IV_SIZE + self.HMAC_SIZE + 16:
+            raise ValueError("Data too short to be a valid CPSN v2 archive")
+
+        offset = 0
+        magic = data[offset:offset+4]; offset += 4
+        if magic != CPSN_MAGIC:
+            raise ValueError("Invalid CPSN magic header")
+
+        version = data[offset]; offset += 1
+        if version != self.CPSN_VERSION:
+            raise ValueError(f"Unsupported CPSN version: {version}")
+
+        salt = data[offset:offset+self.SALT_SIZE]; offset += self.SALT_SIZE
+        iv = data[offset:offset+self.IV_SIZE]; offset += self.IV_SIZE
+        ciphertext = data[offset:-self.HMAC_SIZE]
+        stored_mac = data[-self.HMAC_SIZE:]
+
+        aes_key, hmac_key = self._derive_keys(password, salt)
+
+        # Verify HMAC (Encrypt-then-MAC)
+        version_byte = struct.pack('B', version)
+        mac_data = version_byte + salt + iv + ciphertext
+        expected_mac = hmac.new(hmac_key, mac_data, hashlib.sha256).digest()
+        if not hmac.compare_digest(stored_mac, expected_mac):
+            raise ValueError("HMAC verification failed - wrong password or corrupted data")
+
+        # Decrypt AES-256-CBC
+        cipher = Cipher(algorithms.AES(aes_key), modes.CBC(iv), backend=default_backend())
+        decryptor = cipher.decryptor()
+        padded = decryptor.update(ciphertext) + decryptor.finalize()
+
+        # Remove PKCS7 padding
+        unpadder = crypto_padding.PKCS7(128).unpadder()
+        plaintext = unpadder.update(padded) + unpadder.finalize()
+
+        return plaintext
 
     def compress_json_file(self, json_file, archive_file):
-        """Compress JSON file using 7z (encrypted) or gzip (unencrypted)."""
+        """Compress and optionally encrypt JSON file."""
         try:
-            if self.use_7z_encryption:
-                try:
-                    if self._compress_with_7z(json_file, archive_file):
-                        return True
-                except FileNotFoundError as e:
-                    debug_print(f"7z not available ({e}); falling back to gzip")
-
+            if self.use_encryption:
+                return self._compress_with_encryption(json_file, archive_file)
             return self._compress_with_gzip(json_file, archive_file)
         except Exception as e:
             debug_print(f"File compression failed: {e}")
             return False
 
-    def _compress_with_7z(self, json_file, archive_file):
-        """Encrypt JSON file into a 7z archive using the Nextcloud password."""
+    def _compress_with_encryption(self, json_file, archive_file):
+        """Compress with gzip then encrypt with AES-256-CBC."""
         json_path = Path(json_file).resolve()
         archive_path = Path(archive_file).resolve()
 
-        seven_zip = self._get_7z_executable()
         password = CONFIG.get('password', '')
         if not str(password).strip():
             raise ValueError("Nextcloud password is empty; cannot encrypt")
 
         original_size = json_path.stat().st_size
-        tmp_archive_path = None
+
+        # Read and gzip-compress the JSON data
+        with open(json_path, 'rb') as f_in:
+            raw_data = f_in.read()
+
+        buf = io.BytesIO()
+        with gzip.GzipFile(fileobj=buf, mode='wb') as gz:
+            gz.write(raw_data)
+        compressed = buf.getvalue()
+
+        # Encrypt the compressed data
+        encrypted = self._encrypt_data(compressed, str(password))
+
+        # Write atomically
+        tmp_archive_path = archive_path.parent / f"{archive_path.name}.{uuid.uuid4().hex}.tmp"
         try:
-            # Create payload in a temp directory, but create the archive temp file
-            # in the destination directory for atomic replace.
-            with tempfile.TemporaryDirectory(prefix='clipson-7z-') as tmpdir:
-                tmpdir_path = Path(tmpdir)
-                payload_name = 'payload.json'
-                payload_path = tmpdir_path / payload_name
-                shutil.copyfile(json_path, payload_path)
-
-                tmp_archive_path = archive_path.parent / f"{archive_path.name}.{uuid.uuid4().hex}.tmp"
-                if tmp_archive_path.exists():
-                    tmp_archive_path.unlink()
-
-                args = [
-                    seven_zip, 'a', '-t7z', '-mhe=on', f'-p{password}',
-                    '-y', '-bd', str(tmp_archive_path), payload_name
-                ]
-
-                result = subprocess.run(
-                    args,
-                    cwd=str(tmpdir_path),
-                    capture_output=True,
-                    text=True
-                )
-
-                if result.returncode != 0:
-                    combined = (result.stderr or '').strip()
-                    if result.stdout and result.stdout.strip():
-                        combined = (combined + "\n" + result.stdout.strip()).strip()
-                    debug_print(f"7z encryption failed (exit {result.returncode}): {combined}")
-                    return False
-
-            # Some 7z builds may append .7z when the output name has no .7z.
-            if not tmp_archive_path.exists():
-                candidate1 = tmp_archive_path.with_name(tmp_archive_path.name + '.7z')
-                candidate2 = tmp_archive_path.with_suffix(tmp_archive_path.suffix + '.7z')
-                if candidate1.exists():
-                    tmp_archive_path = candidate1
-                elif candidate2.exists():
-                    tmp_archive_path = candidate2
-
+            with open(tmp_archive_path, 'wb') as f_out:
+                f_out.write(encrypted)
             os.replace(str(tmp_archive_path), str(archive_path))
         finally:
-            if tmp_archive_path and tmp_archive_path.exists():
+            if tmp_archive_path.exists():
                 try:
                     tmp_archive_path.unlink()
                 except Exception:
                     pass
 
-        # Prepend CPSN signature to the resulting archive.
-        # (Remote sync files are CPSN + raw 7z bytes.)
-        try:
-            with open(archive_path, 'rb') as f_in:
-                head = f_in.read(4)
-
-            if head != CPSN_MAGIC:
-                prefixed_tmp = archive_path.parent / f"{archive_path.name}.{uuid.uuid4().hex}.cpsn"
-                with open(archive_path, 'rb') as f_in, open(prefixed_tmp, 'wb') as f_out:
-                    f_out.write(CPSN_MAGIC)
-                    shutil.copyfileobj(f_in, f_out, length=1024 * 1024)
-                os.replace(str(prefixed_tmp), str(archive_path))
-        except Exception as e:
-            debug_print(f"Warning: failed to prepend CPSN header: {e}")
-            return False
-
         encrypted_size = archive_path.stat().st_size
         ratio = (1 - encrypted_size / original_size) * 100 if original_size > 0 else 0
         debug_print(f"File encryption {original_size} -> {encrypted_size} bytes ({ratio:.1f}% smaller)")
-
         return True
 
     def _compress_with_gzip(self, json_file, archive_file):
@@ -496,90 +522,56 @@ class ClipSon:
                     pass
 
     def decompress_gz_file(self, archive_file, json_file):
-        """Decrypt CPSN/7z archives or decompress gzip archives back into JSON."""
+        """Decrypt CPSN v2 archives or decompress gzip archives back into JSON."""
         archive_path = Path(archive_file).resolve()
         json_path = Path(json_file).resolve()
 
         try:
             with open(archive_path, 'rb') as f_in:
-                magic = f_in.read(6)
+                magic = f_in.read(4)
         except Exception as e:
             debug_print(f"Failed to read archive header: {e}")
             return False
 
-        prefer = None
-        if magic.startswith(CPSN_MAGIC) or magic.startswith(b'\x37\x7a\xbc\xaf\x27\x1c'):
-            prefer = '7z'
-        elif magic.startswith(b'\x1f\x8b'):
-            prefer = 'gzip'
+        if magic == CPSN_MAGIC:
+            return self._decompress_with_decryption(archive_path, json_path)
+        elif magic[:2] == b'\x1f\x8b':
+            return self._decompress_with_gzip(archive_path, json_path)
         else:
-            prefer = '7z' if self.use_7z_encryption else 'gzip'
-
-        methods = [prefer, 'gzip' if prefer == '7z' else '7z']
-
-        for method in methods:
-            if method == '7z':
-                try:
-                    if self._decompress_with_7z(archive_path, json_path):
-                        return True
-                except FileNotFoundError as e:
-                    debug_print(f"7z not available ({e})")
-                    continue
-                except Exception as e:
-                    debug_print(f"7z decompression failed: {e}")
-                    continue
-            else:
-                if self._decompress_with_gzip(archive_path, json_path):
+            # Try encryption first, then gzip as fallback
+            if self.use_encryption:
+                if self._decompress_with_decryption(archive_path, json_path):
                     return True
+            return self._decompress_with_gzip(archive_path, json_path)
 
-        return False
-
-    def _decompress_with_7z(self, archive_path, json_path):
-        seven_zip = self._get_7z_executable()
+    def _decompress_with_decryption(self, archive_path, json_path):
+        """Decrypt CPSN v2 archive and decompress."""
         password = CONFIG.get('password', '')
         if not str(password).strip():
-            raise ValueError("Nextcloud password is empty; cannot decrypt")
+            debug_print("Nextcloud password is empty; cannot decrypt")
+            return False
 
-        with tempfile.TemporaryDirectory(prefix='clipson-7z-') as tmpdir:
-            tmpdir_path = Path(tmpdir)
-            out_dir_arg = f"-o{tmpdir_path}"  # 7z expects -o<dir>
-
-            archive_to_extract = archive_path
+        try:
             with open(archive_path, 'rb') as f_in:
-                head = f_in.read(4)
-                if head == CPSN_MAGIC:
-                    stripped_path = tmpdir_path / 'archive.7z'
-                    with open(stripped_path, 'wb') as f_out:
-                        shutil.copyfileobj(f_in, f_out, length=1024 * 1024)
-                    archive_to_extract = stripped_path
+                data = f_in.read()
 
-            args = [
-                seven_zip, 'x', '-y', '-bd', f'-p{password}', out_dir_arg, str(archive_to_extract)
-            ]
-            result = subprocess.run(
-                args,
-                capture_output=True,
-                text=True
-            )
+            compressed = self._decrypt_data(data, str(password))
 
-            if result.returncode != 0:
-                debug_print(f"7z decryption failed (exit {result.returncode}): {result.stderr.strip()}")
-                return False
+            # Decompress gzip
+            buf = io.BytesIO(compressed)
+            with gzip.GzipFile(fileobj=buf, mode='rb') as gz:
+                raw_data = gz.read()
 
-            payload_path = tmpdir_path / 'payload.json'
-            if payload_path.exists():
-                shutil.copyfile(payload_path, json_path)
-                return True
+            with open(json_path, 'wb') as f_out:
+                f_out.write(raw_data)
 
-            extracted_files = [p for p in tmpdir_path.rglob('*') if p.is_file()]
-            if not extracted_files:
-                debug_print("7z decryption produced no files")
-                return False
-
-            shutil.copyfile(extracted_files[0], json_path)
             return True
+        except Exception as e:
+            debug_print(f"Decryption failed: {e}")
+            return False
 
     def _decompress_with_gzip(self, archive_path, json_path):
+        """Decompress gzip archive (no encryption)."""
         try:
             with gzip.open(archive_path, 'rb') as f_in, open(json_path, 'wb') as f_out:
                 shutil.copyfileobj(f_in, f_out, length=1024 * 1024)
